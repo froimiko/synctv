@@ -180,10 +180,9 @@ func NewEmbyMovieCacheInitFunc(
 
 			if source != nil {
 				resp.Sources[i] = *source
-				resp.Sources[i].Subtitles = processEmbySubtitles(v, truePath, u)
+				resp.Sources[i].Subtitles = processEmbySubtitles(v, truePath, aucd.APIKey, u)
 			}
 		}
-
 		return resp, nil
 	}
 }
@@ -274,6 +273,7 @@ func processMediaSource(
 func processEmbySubtitles(
 	v *emby.MediaSourceInfo,
 	truePath string,
+	apiKey string,
 	u *url.URL,
 ) []*EmbySubtitleCache {
 	subtitles := make([]*EmbySubtitleCache, 0, len(v.GetMediaStreamInfo()))
@@ -282,7 +282,7 @@ func processEmbySubtitles(
 			continue
 		}
 
-		subtutleType := "srt"
+		subtitleType := "srt"
 
 		result, err := url.JoinPath(
 			"emby",
@@ -291,15 +291,18 @@ func processEmbySubtitles(
 			v.GetId(),
 			"Subtitles",
 			strconv.FormatUint(msi.GetIndex(), 10),
-			"Stream."+subtutleType,
+			"Stream."+subtitleType,
 		)
 		if err != nil {
 			continue
 		}
 
-		u.Path = result
-		u.RawQuery = ""
-		url := u.String()
+		subtitleURL := *u
+		subtitleURL.Path = result
+		query := url.Values{}
+		query.Set("api_key", apiKey)
+		subtitleURL.RawQuery = query.Encode()
+		subtitleURLString := subtitleURL.String()
 
 		name := msi.GetDisplayTitle()
 		if name == "" {
@@ -311,10 +314,10 @@ func processEmbySubtitles(
 		}
 
 		subtitles = append(subtitles, &EmbySubtitleCache{
-			URL:   url,
-			Type:  subtutleType,
+			URL:   subtitleURLString,
+			Type:  subtitleType,
 			Name:  name,
-			Cache: refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(url), -1),
+			Cache: refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(subtitleURLString), -1),
 		})
 	}
 
@@ -325,7 +328,7 @@ func newEmbySubtitleCacheInitFunc(url string) func(ctx context.Context) ([]byte,
 	return func(ctx context.Context) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to create subtitle request")
 		}
 
 		req.Header.Set("User-Agent", utils.UA)
@@ -333,12 +336,12 @@ func newEmbySubtitleCacheInitFunc(url string) func(ctx context.Context) ([]byte,
 
 		resp, err := uhc.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to fetch subtitle")
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, errors.New("bad status code")
+			return nil, fmt.Errorf("unexpected subtitle status: %d", resp.StatusCode)
 		}
 
 		return io.ReadAll(resp.Body)

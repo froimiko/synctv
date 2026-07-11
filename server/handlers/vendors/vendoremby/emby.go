@@ -22,6 +22,8 @@ import (
 	"github.com/synctv-org/vendors/api/emby"
 )
 
+var errInvalidSubtitleQuery = errors.New("invalid subtitle query")
+
 type EmbyVendorService struct {
 	room  *op.Room
 	movie *op.Movie
@@ -130,6 +132,21 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		return
 	}
 
+	source, err := strconv.Atoi(ctx.Query("source"))
+	if err != nil {
+		log.Errorf("proxy vendor movie error: %v", err)
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
+		return
+	}
+	if source < 0 {
+		log.Errorf("proxy vendor movie error: %v", "source out of range")
+		ctx.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			model.NewAPIErrorStringResp("source out of range"),
+		)
+		return
+	}
+
 	u, err := op.LoadOrInitUserByID(s.movie.CreatorID)
 	if err != nil {
 		log.Errorf("proxy vendor movie error: %v", err)
@@ -150,14 +167,7 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		return
 	}
 
-	source, err := strconv.Atoi(ctx.Query("source"))
-	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
-		return
-	}
-
-	if source >= len(embyC.Sources) {
+	if source < 0 || source >= len(embyC.Sources) {
 		log.Errorf("proxy vendor movie error: %v", "source out of range")
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
@@ -201,6 +211,22 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 }
 
 func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context) error {
+	source, err := strconv.Atoi(ctx.Query("source"))
+	if err != nil {
+		return fmt.Errorf("%w: invalid source", errInvalidSubtitleQuery)
+	}
+	if source < 0 {
+		return fmt.Errorf("%w: source out of range", errInvalidSubtitleQuery)
+	}
+
+	id, err := strconv.Atoi(ctx.Query("id"))
+	if err != nil {
+		return fmt.Errorf("%w: invalid id", errInvalidSubtitleQuery)
+	}
+	if id < 0 {
+		return fmt.Errorf("%w: id out of range", errInvalidSubtitleQuery)
+	}
+
 	u, err := op.LoadOrInitUserByID(s.movie.CreatorID)
 	if err != nil {
 		return err
@@ -211,22 +237,12 @@ func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context) error {
 		return err
 	}
 
-	source, err := strconv.Atoi(ctx.Query("source"))
-	if err != nil {
-		return err
-	}
-
 	if source >= len(embyC.Sources) {
-		return errors.New("source out of range")
-	}
-
-	id, err := strconv.Atoi(ctx.Query("id"))
-	if err != nil {
-		return err
+		return fmt.Errorf("%w: source out of range", errInvalidSubtitleQuery)
 	}
 
 	if id >= len(embyC.Sources[source].Subtitles) {
-		return errors.New("id out of range")
+		return fmt.Errorf("%w: id out of range", errInvalidSubtitleQuery)
 	}
 
 	data, err := embyC.Sources[source].Subtitles[id].Cache.Get(ctx)
@@ -250,13 +266,42 @@ func (s *EmbyVendorService) ProxyMovie(ctx *gin.Context) {
 	case "":
 		s.handleProxyMovie(ctx)
 	case "subtitle":
-		_ = s.handleSubtitle(ctx)
+		if err := s.handleSubtitle(ctx); err != nil {
+			log := middlewares.GetLogger(ctx)
+			log.Errorf("proxy vendor subtitle error: %v", err)
+
+			if errors.Is(err, errInvalidSubtitleQuery) {
+				ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
+				return
+			}
+
+			ctx.AbortWithStatusJSON(
+				http.StatusInternalServerError,
+				model.NewAPIErrorStringResp("failed to load subtitle"),
+			)
+		}
 	default:
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
 			model.NewAPIErrorStringResp("unknown proxy type: "+t),
 		)
 	}
+}
+
+func embySubtitleProxyURL(movieID, roomID, userToken string, source, id int) (string, error) {
+	rawPath, err := url.JoinPath("/api/room/movie/proxy", movieID)
+	if err != nil {
+		return "", err
+	}
+
+	rawQuery := url.Values{}
+	rawQuery.Set("t", "subtitle")
+	rawQuery.Set("source", strconv.Itoa(source))
+	rawQuery.Set("id", strconv.Itoa(id))
+	rawQuery.Set("token", userToken)
+	rawQuery.Set("roomId", roomID)
+
+	return (&url.URL{Path: rawPath, RawQuery: rawQuery.Encode()}).String(), nil
 }
 
 func (s *EmbyVendorService) GenMovieInfo(
@@ -282,40 +327,49 @@ func (s *EmbyVendorService) GenMovieInfo(
 		return nil, err
 	}
 
-	if len(data.Sources) == 0 {
-		return nil, errors.New("no source")
-	}
-
-	movie.URL = data.Sources[0].URL
-	for _, s := range data.Sources[0].Subtitles {
-		if movie.Subtitles == nil {
-			movie.Subtitles = make(map[string]*dbModel.Subtitle, len(data.Sources[0].Subtitles))
+	hasSource := false
+	for sourceIndex, source := range data.Sources {
+		if source.URL == "" {
+			continue
 		}
 
-		movie.Subtitles[s.Name] = &dbModel.Subtitle{
-			URL:  s.URL,
-			Type: s.Type,
+		if !hasSource {
+			movie.URL = source.URL
+			hasSource = true
+		} else {
+			movie.MoreSources = append(movie.MoreSources,
+				&dbModel.MoreSource{
+					Name: source.Name,
+					URL:  source.URL,
+				},
+			)
 		}
-	}
 
-	for _, s := range data.Sources[1:] {
-		movie.MoreSources = append(movie.MoreSources,
-			&dbModel.MoreSource{
-				Name: s.Name,
-				URL:  s.URL,
-			},
-		)
-
-		for _, subt := range s.Subtitles {
+		for subtitleIndex, subtitle := range source.Subtitles {
 			if movie.Subtitles == nil {
-				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(s.Subtitles))
+				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(source.Subtitles))
 			}
 
-			movie.Subtitles[subt.Name] = &dbModel.Subtitle{
-				URL:  subt.URL,
-				Type: subt.Type,
+			subtitleURL, err := embySubtitleProxyURL(
+				movie.ID,
+				movie.RoomID,
+				userToken,
+				sourceIndex,
+				subtitleIndex,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			movie.Subtitles[subtitle.Name] = &dbModel.Subtitle{
+				URL:  subtitleURL,
+				Type: subtitle.Type,
 			}
 		}
+	}
+
+	if !hasSource {
+		return nil, errors.New("no source")
 	}
 
 	return movie, nil
@@ -387,18 +441,19 @@ func (s *EmbyVendorService) GenProxyMovieInfo(
 				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(es.Subtitles))
 			}
 
-			rawQuery := url.Values{}
-			rawQuery.Set("t", "subtitle")
-			rawQuery.Set("source", strconv.Itoa(si))
-			rawQuery.Set("id", strconv.Itoa(sbi))
-			rawQuery.Set("token", userToken)
-			rawQuery.Set("roomId", movie.RoomID)
-			u := url.URL{
-				Path:     rawPath,
-				RawQuery: rawQuery.Encode(),
+			subtitleURL, err := embySubtitleProxyURL(
+				movie.ID,
+				movie.RoomID,
+				userToken,
+				si,
+				sbi,
+			)
+			if err != nil {
+				return nil, err
 			}
+
 			movie.Subtitles[s.Name] = &dbModel.Subtitle{
-				URL:  u.String(),
+				URL:  subtitleURL,
 				Type: s.Type,
 			}
 		}

@@ -90,7 +90,67 @@ docker run -d --name synctv -v /opt/synctv:/root/.synctv -p 8080:8080 synctvorg/
 
 ## Docker compose
 
-[docker-compose.yml](./script/docker-compose.yml)
+### 运行官方发布镜像
+
+现有的 [`script/docker-compose.yml`](./script/docker-compose.yml) 配置用于运行官方已发布的 SyncTV 镜像。在仓库根目录直接复制并执行：
+
+```bash
+docker compose -f script/docker-compose.yml up -d
+```
+
+### 从当前本地源码构建运行
+
+此方式会构建并运行当前本地工作区中的代码，包括尚未发布到官方版本的修改。
+
+宿主机只需安装 Docker Desktop，或 Docker Engine + Docker Compose v2；不需要安装 Go 或 Node.js。
+
+首次运行时，在仓库根目录按顺序复制并执行：
+
+```bash
+git submodule update --init --recursive
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+容器启动后，访问 [http://localhost:8080](http://localhost:8080)。首次初始化的用户名和密码都是 `root`，登录后请立即修改密码。
+
+程序数据保存在 Docker 命名卷 `synctv-local-data` 中，普通重建或替换容器不会丢失数据。
+
+如果 `8080` 端口已被现有容器占用，请先停止旧容器。也可以修改 `docker-compose.local.yml` 中端口映射左侧的数字，例如把 `8080:8080` 改为 `18080:8080`，然后访问 `http://localhost:18080`。
+
+常用命令：
+
+- 持续查看容器日志：
+
+  ```bash
+  docker compose -f docker-compose.local.yml logs -f
+  ```
+
+- 更新源码后重新构建并启动：
+
+  ```bash
+  docker compose -f docker-compose.local.yml up -d --build
+  ```
+
+- 停止并删除容器，但保留全部程序数据：
+
+  ```bash
+  docker compose -f docker-compose.local.yml down
+  ```
+
+- 完全不使用 Docker 构建缓存重新构建，然后启动容器：
+
+  ```bash
+  docker compose -f docker-compose.local.yml build --no-cache
+  docker compose -f docker-compose.local.yml up -d
+  ```
+
+- 删除容器和本地数据：
+
+  > **警告：** 以下命令会永久删除 `synctv-local-data` 数据卷，其中的账号、配置和数据库数据都会被删除。
+
+  ```bash
+  docker compose -f docker-compose.local.yml down -v
+  ```
 
 ## Helm
 

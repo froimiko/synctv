@@ -1,0 +1,23 @@
+services:
+  synctv-local:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: dev
+    image: synctv-local
+    container_name: synctv-local
+    restart: unless-stopped
+    ports:
+      - '8080:8080/tcp'
+      - '8080:8080/udp'
+    volumes:
+      - synctv-local-data:/root/.synctv
+    environment:
+      - PUID=0
+      - PGID=0
+      - UMASK=022
+      - TZ=Asia/Shanghai
+
+volumes:
+  synctv-local-data:

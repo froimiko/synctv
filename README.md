@@ -90,7 +90,67 @@ docker run -d --name synctv -v /opt/synctv:/root/.synctv -p 8080:8080 synctvorg/
 
 ## Docker compose
 
-[docker-compose.yml](./script/docker-compose.yml)
+### Run the official release image
+
+The existing [`script/docker-compose.yml`](./script/docker-compose.yml) configuration runs the official published SyncTV image. Copy and run this command from the repository root:
+
+```bash
+docker compose -f script/docker-compose.yml up -d
+```
+
+### Build and run from local source
+
+Use this option when you want to build and run the code in your current local workspace, including changes that have not been published in an official release yet.
+
+The host only needs Docker Desktop, or Docker Engine with Docker Compose v2. You do not need to install Go or Node.js.
+
+For the first run, copy and run these commands in order from the repository root:
+
+```bash
+git submodule update --init --recursive
+docker compose -f docker-compose.local.yml up -d --build
+```
+
+When the container is ready, open [http://localhost:8080](http://localhost:8080). On first initialization, sign in with username `root` and password `root`, then change the password immediately.
+
+Application data is stored in the Docker named volume `synctv-local-data`. Normal rebuilds and container replacement do not delete this data.
+
+If port `8080` is already used by an existing container, stop that container first. Alternatively, change the number on the left side of the port mapping in `docker-compose.local.yml`, for example from `8080:8080` to `18080:8080`, and then open `http://localhost:18080` instead.
+
+Common commands:
+
+- Follow the container logs:
+
+  ```bash
+  docker compose -f docker-compose.local.yml logs -f
+  ```
+
+- Rebuild and restart after updating the source code:
+
+  ```bash
+  docker compose -f docker-compose.local.yml up -d --build
+  ```
+
+- Stop and remove the container while keeping all application data:
+
+  ```bash
+  docker compose -f docker-compose.local.yml down
+  ```
+
+- Rebuild completely without using the Docker build cache, then start the container:
+
+  ```bash
+  docker compose -f docker-compose.local.yml build --no-cache
+  docker compose -f docker-compose.local.yml up -d
+  ```
+
+- Delete the container and its local data:
+
+  > **Warning:** The following command permanently deletes the `synctv-local-data` volume, including all accounts, settings, and database data.
+
+  ```bash
+  docker compose -f docker-compose.local.yml down -v
+  ```
 
 ## Helm
 

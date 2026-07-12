@@ -12,7 +12,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
-	"github.com/synctv-org/synctv/cmd/flags"
 	"github.com/synctv-org/synctv/internal/conf"
 	"github.com/synctv-org/synctv/internal/settings"
 	"github.com/synctv-org/synctv/server/model"
@@ -21,9 +20,11 @@ import (
 )
 
 var (
-	defaultCache  *MemoryCache
-	fileCacheOnce sync.Once
-	fileCache     Cache
+	defaultCache            *MemoryCache
+	fileCacheOnce           sync.Once
+	fileCache               Cache
+	errInvalidProxyTarget    = errors.New("invalid proxy target")
+	errFailedToProxyMedia    = errors.New("failed to proxy media")
 )
 
 const (
@@ -117,32 +118,21 @@ func NewProxyURLOptions(opts ...Option) *Options {
 	return o
 }
 
-const (
-	sliceSize      = 1024 * 1024 * 2
-	proxyURLHeader = "X-Proxy-URL"
-)
+const sliceSize = 1024 * 1024 * 2
 
 func URL(ctx *gin.Context, u string, headers map[string]string, opts ...Option) error {
-	if flags.Global.Dev {
-		ctx.Header(proxyURLHeader, u)
-	}
-
 	o := NewProxyURLOptions(opts...)
 
 	if !settings.AllowProxyToLocal.Get() {
 		if l, err := utils.ParseURLIsLocalIP(u); err != nil {
 			ctx.AbortWithStatusJSON(http.StatusBadRequest,
-				model.NewAPIErrorStringResp(
-					fmt.Sprintf("check url is local ip error: %v", err),
-				),
+				model.NewAPIErrorStringResp(errInvalidProxyTarget.Error()),
 			)
 
-			return fmt.Errorf("check url is local ip error: %w", err)
+			return errInvalidProxyTarget
 		} else if l {
 			ctx.AbortWithStatusJSON(http.StatusBadRequest,
-				model.NewAPIErrorStringResp(
-					"not allow proxy to local",
-				),
+				model.NewAPIErrorStringResp("not allow proxy to local"),
 			)
 
 			return errors.New("not allow proxy to local")
@@ -164,8 +154,17 @@ func URL(ctx *gin.Context, u string, headers map[string]string, opts ...Option) 
 			o.CacheKey = u
 		}
 
-		return NewSliceCacheProxy(o.CacheKey, sliceSize, rsc, getCache()).
+		err := NewSliceCacheProxy(o.CacheKey, sliceSize, rsc, getCache()).
 			Proxy(ctx.Writer, ctx.Request)
+		if err != nil {
+			if !ctx.Writer.Written() {
+				ctx.AbortWithStatusJSON(http.StatusBadGateway,
+					model.NewAPIErrorStringResp(errFailedToProxyMedia.Error()),
+				)
+			}
+			return errFailedToProxyMedia
+		}
+		return nil
 	}
 
 	ctx2, cf := context.WithCancel(ctx)
@@ -174,12 +173,10 @@ func URL(ctx *gin.Context, u string, headers map[string]string, opts ...Option) 
 	req, err := http.NewRequestWithContext(ctx2, http.MethodGet, u, nil)
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusBadRequest,
-			model.NewAPIErrorStringResp(
-				fmt.Sprintf("new request error: %v", err),
-			),
+			model.NewAPIErrorStringResp(errInvalidProxyTarget.Error()),
 		)
 
-		return fmt.Errorf("new request error: %w", err)
+		return errInvalidProxyTarget
 	}
 
 	for k, v := range headers {
@@ -215,13 +212,11 @@ func URL(ctx *gin.Context, u string, headers map[string]string, opts ...Option) 
 
 	resp, err := cli.Do(req)
 	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest,
-			model.NewAPIErrorStringResp(
-				fmt.Sprintf("request url error: %v", err),
-			),
+		ctx.AbortWithStatusJSON(http.StatusBadGateway,
+			model.NewAPIErrorStringResp(errFailedToProxyMedia.Error()),
 		)
 
-		return fmt.Errorf("request url error: %w", err)
+		return errFailedToProxyMedia
 	}
 	defer resp.Body.Close()
 
@@ -234,18 +229,11 @@ func URL(ctx *gin.Context, u string, headers map[string]string, opts ...Option) 
 
 	_, err = copyBuffer(ctx.Writer, resp.Body)
 	if err != nil && !errors.Is(err, io.EOF) {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest,
-			model.NewAPIErrorStringResp(
-				fmt.Sprintf("copy response body error: %v", err),
-			),
-		)
-
-		return fmt.Errorf("copy response body error: %w", err)
+		return errFailedToProxyMedia
 	}
 
 	return nil
 }
-
 func AutoProxyURL(
 	ctx *gin.Context,
 	u, t string,

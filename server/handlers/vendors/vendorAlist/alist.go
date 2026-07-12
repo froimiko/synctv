@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -45,19 +44,48 @@ func (s *AlistVendorService) Client() alist.AlistHTTPServer {
 	return vendor.LoadAlistClient(s.movie.VendorInfo.Backend)
 }
 
+type dynamicMovieAlistCredentials struct {
+	host    string
+	token   string
+	backend string
+}
+
+func dynamicMovieAlistCredentialsFromCache(
+	ctx context.Context,
+	creatorCache *cache.AlistUserCache,
+	serverID string,
+) (*dynamicMovieAlistCredentials, error) {
+	aucd, err := creatorCache.LoadOrStore(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dynamicMovieAlistCredentials{
+		host:    aucd.Host,
+		token:   aucd.Token,
+		backend: aucd.Backend,
+	}, nil
+}
+
+func loadDynamicMovieAlistCredentials(
+	ctx context.Context,
+	creatorID, serverID string,
+) (*dynamicMovieAlistCredentials, error) {
+	creator, err := op.LoadOrInitUserByID(creatorID)
+	if err != nil {
+		return nil, err
+	}
+
+	return dynamicMovieAlistCredentialsFromCache(ctx, creator.Value().AlistCache(), serverID)
+}
+
 //nolint:gosec
 func (s *AlistVendorService) ListDynamicMovie(
 	ctx context.Context,
-	reqUser *op.User,
+	_ *op.User,
 	subPath, keyword string,
 	page, _max int,
 ) (*model.MovieList, error) {
-	if reqUser.ID != s.movie.CreatorID {
-		return nil, fmt.Errorf("list vendor dynamic folder error: %w", dbModel.ErrNoPermission)
-	}
-
-	user := reqUser
-
 	resp := &model.MovieList{
 		Paths: []*model.MoviePath{},
 	}
@@ -67,13 +95,16 @@ func (s *AlistVendorService) ListDynamicMovie(
 		return nil, fmt.Errorf("load alist server id error: %w", err)
 	}
 
-	newPath := path.Join(truePath, subPath)
-	// check new path is in parent path
-	if !strings.HasPrefix(newPath, truePath) {
-		return nil, errors.New("sub path is not in parent path")
+	truePath, err = cache.ResolveAlistPath(truePath, "")
+	if err != nil {
+		return nil, err
+	}
+	newPath, err := cache.ResolveAlistPath(truePath, subPath)
+	if err != nil {
+		return nil, err
 	}
 
-	aucd, err := user.AlistCache().LoadOrStore(ctx, serverID)
+	credentials, err := loadDynamicMovieAlistCredentials(ctx, s.movie.CreatorID, serverID)
 	if err != nil {
 		if errors.Is(err, db.NotFoundError(db.ErrVendorNotFound)) {
 			return nil, errors.New("alist server not found")
@@ -81,50 +112,49 @@ func (s *AlistVendorService) ListDynamicMovie(
 		return nil, err
 	}
 
-	cli := s.Client()
+	cli := vendor.LoadAlistClient(credentials.backend)
 	if keyword != "" {
 		data, err := cli.FsSearch(ctx, &alist.FsSearchReq{
-			Token:    aucd.Token,
+			Token:    credentials.token,
 			Password: s.movie.VendorInfo.Alist.Password,
 			Parent:   newPath,
-			Host:     aucd.Host,
+			Host:     credentials.host,
 			Page:     uint64(page),
 			PerPage:  uint64(_max),
 			Keywords: keyword,
 		})
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to list media")
 		}
 
 		resp.Total = int64(data.GetTotal())
 
 		resp.Movies = make([]*model.Movie, len(data.GetContent()))
 		for i, flr := range data.GetContent() {
-			fileSubPath := strings.TrimPrefix(strings.Trim(flr.GetParent(), "/"), truePath)
+			fileSubPath, err := cache.ResolveAlistSearchSubPath(truePath, newPath, flr.GetParent(), flr.GetName())
+			if err != nil {
+				return nil, err
+			}
+			resultPath, err := cache.ResolveAlistPath(truePath, fileSubPath)
+			if err != nil {
+				return nil, err
+			}
+
 			resp.Movies[i] = &model.Movie{
 				ID:        s.movie.ID,
 				CreatedAt: s.movie.CreatedAt.UnixMilli(),
 				Creator:   op.GetUserName(s.movie.CreatorID),
 				CreatorID: s.movie.CreatorID,
-				SubPath: "/" + strings.Trim(
-					fmt.Sprintf("%s/%s", fileSubPath, flr.GetName()),
-					"/",
-				),
+				SubPath:   fileSubPath,
 				Base: dbModel.MovieBase{
 					Name:     flr.GetName(),
 					IsFolder: flr.GetIsDir(),
 					ParentID: dbModel.EmptyNullString(s.movie.ID),
 					VendorInfo: dbModel.VendorInfo{
 						Vendor:  dbModel.VendorAlist,
-						Backend: s.movie.VendorInfo.Backend,
+						Backend: credentials.backend,
 						Alist: &dbModel.AlistStreamingInfo{
-							Path: dbModel.FormatAlistPath(
-								serverID,
-								"/"+strings.Trim(
-									fmt.Sprintf("%s/%s", flr.GetParent(), flr.GetName()),
-									"/",
-								),
-							),
+							Path: dbModel.FormatAlistPath(serverID, resultPath),
 						},
 					},
 				},
@@ -137,16 +167,16 @@ func (s *AlistVendorService) ListDynamicMovie(
 	}
 
 	data, err := cli.FsList(ctx, &alist.FsListReq{
-		Token:    aucd.Token,
+		Token:    credentials.token,
 		Password: s.movie.VendorInfo.Alist.Password,
 		Path:     newPath,
-		Host:     aucd.Host,
+		Host:     credentials.host,
 		Refresh:  false,
 		Page:     uint64(page),
 		PerPage:  uint64(_max),
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.New("failed to list media")
 	}
 
 	resp.Total = int64(data.GetTotal())
@@ -165,7 +195,7 @@ func (s *AlistVendorService) ListDynamicMovie(
 				ParentID: dbModel.EmptyNullString(s.movie.ID),
 				VendorInfo: dbModel.VendorInfo{
 					Vendor:  dbModel.VendorAlist,
-					Backend: s.movie.VendorInfo.Backend,
+					Backend: credentials.backend,
 					Alist: &dbModel.AlistStreamingInfo{
 						Path: dbModel.FormatAlistPath(serverID,
 							"/"+strings.Trim(fmt.Sprintf("%s/%s", newPath, flr.GetName()), "/"),
@@ -187,8 +217,8 @@ func (s *AlistVendorService) ProxyMovie(ctx *gin.Context) {
 	// Get cache data
 	data, err := s.getCacheData(ctx)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		log.Error("proxy vendor movie error: failed to load media source")
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("failed to load media source"))
 		return
 	}
 
@@ -225,47 +255,60 @@ func (s *AlistVendorService) handleAliProvider(
 	log *logrus.Entry,
 	data *cache.AlistMovieCacheData,
 ) {
-	t := ctx.Query("t")
-	switch t {
+	switch ctx.Query("t") {
 	case "":
-		b, err := data.Ali.Get(ctx)
+		ali, err := data.Ali.Get(ctx)
 		if err != nil {
-			log.Errorf("proxy vendor movie error: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+			log.Error("proxy vendor movie error: failed to load media source")
+			ctx.AbortWithStatusJSON(
+				http.StatusInternalServerError,
+				model.NewAPIErrorStringResp("failed to load media source"),
+			)
 			return
 		}
 
-		if s.movie.Proxy {
-			err := proxy.M3u8Data(
-				ctx,
-				b.M3U8ListFile,
-				"",
-				ctx.GetString("token"),
-				s.movie.RoomID,
-				s.movie.ID,
-			)
-			if err != nil {
-				log.Errorf("proxy vendor movie error: %v", err)
-			}
-		} else {
-			ctx.Data(http.StatusOK, "audio/mpegurl", b.M3U8ListFile)
+		if !s.movie.Proxy {
+			ctx.Data(http.StatusOK, "audio/mpegurl", ali.M3U8ListFile)
+			return
+		}
+
+		if err := proxy.M3u8Data(
+			ctx,
+			ali.M3U8ListFile,
+			"",
+			ctx.GetString("token"),
+			s.movie.RoomID,
+			s.movie.ID,
+		); err != nil {
+			log.Error("proxy vendor movie error: failed to proxy media")
 		}
 	case "raw":
-		b, err := data.Ali.Get(ctx)
+		ali, err := data.Ali.Get(ctx)
 		if err != nil {
-			log.Errorf("proxy vendor movie error: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+			log.Error("proxy vendor movie error: failed to load media source")
+			ctx.AbortWithStatusJSON(
+				http.StatusInternalServerError,
+				model.NewAPIErrorStringResp("failed to load media source"),
+			)
 			return
 		}
 
-		if s.movie.Proxy {
-			s.proxyURL(ctx, log, b.URL)
-		} else {
-			ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("proxy is not enabled"))
+		if !s.movie.Proxy {
+			ctx.AbortWithStatusJSON(
+				http.StatusBadRequest,
+				model.NewAPIErrorStringResp("proxy is not enabled"),
+			)
 			return
 		}
+
+		s.proxyURL(ctx, log, ali.URL)
 	case "subtitle":
 		s.handleAliSubtitle(ctx, log, data)
+	default:
+		ctx.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			model.NewAPIErrorStringResp("invalid proxy type"),
+		)
 	}
 }
 
@@ -274,55 +317,56 @@ func (s *AlistVendorService) handleDefaultProvider(
 	log *logrus.Entry,
 	data *cache.AlistMovieCacheData,
 ) {
-	t := ctx.Query("t")
-	switch t {
+	switch ctx.Query("t") {
 	case "subtitle":
 		idS := ctx.Query("id")
 		if idS == "" {
-			log.Errorf("proxy vendor movie error: %v", "id is empty")
+			log.Error("proxy vendor subtitle error: id is empty")
 			ctx.AbortWithStatusJSON(
 				http.StatusBadRequest,
 				model.NewAPIErrorStringResp("id is empty"),
 			)
-
 			return
 		}
 
 		id, err := strconv.Atoi(idS)
 		if err != nil {
-			log.Errorf("proxy vendor movie error: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
+			log.Error("proxy vendor subtitle error: invalid id")
+			ctx.AbortWithStatusJSON(
+				http.StatusBadRequest,
+				model.NewAPIErrorStringResp("invalid id"),
+			)
 			return
 		}
 
-		if id >= len(data.Subtitles) {
-			log.Errorf("proxy vendor movie error: %v", "id out of range")
+		if id < 0 || id >= len(data.Subtitles) {
+			log.Error("proxy vendor subtitle error: id out of range")
 			ctx.AbortWithStatusJSON(
 				http.StatusBadRequest,
 				model.NewAPIErrorStringResp("id out of range"),
 			)
-
 			return
 		}
 
 		subtitle := data.Subtitles[id]
-
 		b, err := subtitle.Cache.Get(ctx)
 		if err != nil {
-			log.Errorf("proxy vendor movie error: %v", err)
-			ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+			log.Error("proxy vendor subtitle error: failed to load subtitle")
+			ctx.AbortWithStatusJSON(
+				http.StatusInternalServerError,
+				model.NewAPIErrorStringResp("failed to load subtitle"),
+			)
 			return
 		}
 
 		http.ServeContent(ctx.Writer, ctx.Request, subtitle.Name, time.Now(), bytes.NewReader(b))
 	default:
 		if !s.movie.Proxy {
-			log.Errorf("proxy vendor movie error: %v", "proxy is not enabled")
+			log.Error("proxy vendor movie error: proxy is not enabled")
 			ctx.AbortWithStatusJSON(
 				http.StatusBadRequest,
 				model.NewAPIErrorStringResp("proxy is not enabled"),
 			)
-
 			return
 		}
 
@@ -331,7 +375,8 @@ func (s *AlistVendorService) handleDefaultProvider(
 }
 
 func (s *AlistVendorService) proxyURL(ctx *gin.Context, log *logrus.Entry, url string) {
-	err := proxy.AutoProxyURL(ctx,
+	if err := proxy.AutoProxyURL(
+		ctx,
 		url,
 		s.movie.Type,
 		nil,
@@ -339,9 +384,8 @@ func (s *AlistVendorService) proxyURL(ctx *gin.Context, log *logrus.Entry, url s
 		s.movie.RoomID,
 		s.movie.ID,
 		proxy.WithProxyURLCache(true),
-	)
-	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
+	); err != nil {
+		log.Error("proxy vendor movie error: failed to proxy media")
 	}
 }
 
@@ -352,22 +396,39 @@ func (s *AlistVendorService) handleAliSubtitle(
 ) {
 	idS := ctx.Query("id")
 	if idS == "" {
-		log.Errorf("proxy vendor movie error: %v", "id is empty")
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("id is empty"))
+		log.Error("proxy vendor subtitle error: id is empty")
+		ctx.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			model.NewAPIErrorStringResp("id is empty"),
+		)
 		return
 	}
 
 	id, err := strconv.Atoi(idS)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
+		log.Error("proxy vendor subtitle error: invalid id")
+		ctx.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			model.NewAPIErrorStringResp("invalid id"),
+		)
+		return
+	}
+	if id < 0 {
+		log.Error("proxy vendor subtitle error: id out of range")
+		ctx.AbortWithStatusJSON(
+			http.StatusBadRequest,
+			model.NewAPIErrorStringResp("id out of range"),
+		)
 		return
 	}
 
 	ali, err := data.Ali.Get(ctx)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		log.Error("proxy vendor subtitle error: failed to load subtitle")
+		ctx.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			model.NewAPIErrorStringResp("failed to load subtitle"),
+		)
 		return
 	}
 
@@ -378,19 +439,21 @@ func (s *AlistVendorService) handleAliSubtitle(
 	case id < len(data.Subtitles)+len(ali.Subtitles):
 		subtitle = ali.Subtitles[id-len(data.Subtitles)]
 	default:
-		log.Errorf("proxy vendor movie error: %v", "id out of range")
+		log.Error("proxy vendor subtitle error: id out of range")
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
 			model.NewAPIErrorStringResp("id out of range"),
 		)
-
 		return
 	}
 
 	b, err := subtitle.Cache.Get(ctx)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		log.Error("proxy vendor subtitle error: failed to load subtitle")
+		ctx.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			model.NewAPIErrorStringResp("failed to load subtitle"),
+		)
 		return
 	}
 
@@ -422,7 +485,7 @@ func (s *AlistVendorService) GenMovieInfo(
 		UserAgent: utils.UA,
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.New("failed to load media source")
 	}
 
 	for i, subt := range data.Subtitles {
@@ -446,7 +509,7 @@ func (s *AlistVendorService) GenMovieInfo(
 	case cache.AlistProviderAli:
 		ali, err := data.Ali.Get(ctx)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to load media source")
 		}
 
 		movie.URL = fmt.Sprintf(
@@ -499,7 +562,7 @@ func (s *AlistVendorService) GenMovieInfo(
 			UserAgent: userAgent,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("refresh 115 movie cache error: %w", err)
+			return nil, errors.New("failed to load media source")
 		}
 
 		movie.URL = data.URL
@@ -542,7 +605,7 @@ func (s *AlistVendorService) GenProxyMovieInfo(
 		UserAgent: utils.UA,
 	})
 	if err != nil {
-		return nil, err
+		return nil, errors.New("failed to load media source")
 	}
 
 	for i, subt := range data.Subtitles {
@@ -566,7 +629,7 @@ func (s *AlistVendorService) GenProxyMovieInfo(
 	case cache.AlistProviderAli:
 		ali, err := data.Ali.Get(ctx)
 		if err != nil {
-			return nil, err
+			return nil, errors.New("failed to load media source")
 		}
 
 		movie.URL = fmt.Sprintf(

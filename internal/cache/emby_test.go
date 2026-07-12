@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +11,153 @@ import (
 
 	"github.com/synctv-org/vendors/api/emby"
 )
+
+type fakeEmbyItemGetter struct {
+	items map[string]*emby.Item
+	err   error
+	calls int
+}
+
+func (f *fakeEmbyItemGetter) GetItem(
+	_ context.Context,
+	req *emby.GetItemReq,
+) (*emby.Item, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.items[req.GetItemId()], nil
+}
+
+func TestValidateEmbyItemInRoot(t *testing.T) {
+	tests := []struct {
+		name          string
+		rootItemID    string
+		requestedID   string
+		items         map[string]*emby.Item
+		getItemErr    error
+		wantErr       bool
+		wantItemCalls int
+	}{
+		{
+			name:          "root itself",
+			rootItemID:    "root",
+			requestedID:   "root",
+			wantItemCalls: 0,
+		},
+		{
+			name:          "empty root",
+			requestedID:   "child",
+			wantErr:       true,
+			wantItemCalls: 0,
+		},
+		{
+			name:          "empty request",
+			rootItemID:    "root",
+			wantErr:       true,
+			wantItemCalls: 0,
+		},
+		{
+			name:        "direct descendant",
+			rootItemID:  "root",
+			requestedID: "child",
+			items: map[string]*emby.Item{
+				"child": {Id: "child", ParentId: "root"},
+			},
+			wantItemCalls: 1,
+		},
+		{
+			name:        "multi level descendant",
+			rootItemID:  "root",
+			requestedID: "grandchild",
+			items: map[string]*emby.Item{
+				"grandchild": {Id: "grandchild", ParentId: "child"},
+				"child":      {Id: "child", ParentId: "root"},
+			},
+			wantItemCalls: 2,
+		},
+		{
+			name:        "unrelated root",
+			rootItemID:  "root",
+			requestedID: "child",
+			items: map[string]*emby.Item{
+				"child": {Id: "child", ParentId: "other"},
+				"other": {Id: "other"},
+			},
+			wantErr:       true,
+			wantItemCalls: 2,
+		},
+		{
+			name:        "empty parent",
+			rootItemID:  "root",
+			requestedID: "child",
+			items: map[string]*emby.Item{
+				"child": {Id: "child"},
+			},
+			wantErr:       true,
+			wantItemCalls: 1,
+		},
+		{
+			name:        "cycle",
+			rootItemID:  "root",
+			requestedID: "child",
+			items: map[string]*emby.Item{
+				"child": {Id: "child", ParentId: "parent"},
+				"parent": {Id: "parent", ParentId: "child"},
+			},
+			wantErr:       true,
+			wantItemCalls: 2,
+		},
+		{
+			name:        "returned ID mismatch",
+			rootItemID:  "root",
+			requestedID: "child",
+			items: map[string]*emby.Item{
+				"child": {Id: "different", ParentId: "root"},
+			},
+			wantErr:       true,
+			wantItemCalls: 1,
+		},
+		{
+			name:          "GetItem error",
+			rootItemID:    "root",
+			requestedID:   "child",
+			getItemErr:    errors.New("upstream failure"),
+			wantErr:       true,
+			wantItemCalls: 1,
+		},
+		{
+			name:          "nil item",
+			rootItemID:    "root",
+			requestedID:   "missing",
+			items:         map[string]*emby.Item{},
+			wantErr:       true,
+			wantItemCalls: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cli := &fakeEmbyItemGetter{items: tt.items, err: tt.getItemErr}
+			err := ValidateEmbyItemInRoot(
+				context.Background(), cli, "https://emby.example", "secret", tt.rootItemID, tt.requestedID,
+			)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validation error state mismatch")
+			}
+			if cli.calls != tt.wantItemCalls {
+				t.Fatalf("GetItem calls = %d, want %d", cli.calls, tt.wantItemCalls)
+			}
+			if err != nil {
+				for _, sensitive := range []string{"https://emby.example", "secret"} {
+					if strings.Contains(err.Error(), sensitive) {
+						t.Fatalf("validation error leaked credentials")
+					}
+				}
+			}
+		})
+	}
+}
 
 func TestProcessEmbySubtitlesBuildsIndependentAuthenticatedURLs(t *testing.T) {
 	const (

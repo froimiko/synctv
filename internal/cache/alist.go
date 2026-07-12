@@ -30,6 +30,67 @@ type AlistUserCacheData struct {
 	Backend  string
 }
 
+func ResolveAlistPath(basePath, subPath string) (string, error) {
+	if hasUnsafeAlistPath(basePath) || hasUnsafeAlistPath(subPath) {
+		return "", errors.New("sub path is not in parent path")
+	}
+
+	basePath = path.Clean("/" + strings.TrimLeft(basePath, "/"))
+	targetPath := path.Clean(path.Join(basePath, subPath))
+
+	if targetPath == basePath || basePath == "/" || strings.HasPrefix(targetPath, basePath+"/") {
+		return targetPath, nil
+	}
+
+	return "", errors.New("sub path is not in parent path")
+}
+
+func ResolveAlistSearchSubPath(sharedRoot, searchRoot, resultParent, name string) (string, error) {
+	if hasUnsafeAlistPath(sharedRoot) || hasUnsafeAlistPath(searchRoot) || hasUnsafeAlistPath(resultParent) ||
+		name == "" || name == "." || name == ".." || strings.ContainsAny(name, "/\\") {
+		return "", errors.New("search result is not in parent path")
+	}
+
+	sharedRoot = cleanAlistPath(sharedRoot)
+	searchRoot = cleanAlistPath(searchRoot)
+	resultParent = cleanAlistPath(resultParent)
+
+	if !isAlistPathWithin(sharedRoot, searchRoot) || !isAlistPathWithin(searchRoot, resultParent) {
+		return "", errors.New("search result is not in parent path")
+	}
+
+	resultPath := path.Join(resultParent, name)
+	if !isAlistPathWithin(sharedRoot, resultPath) {
+		return "", errors.New("search result is not in parent path")
+	}
+
+	if sharedRoot == "/" {
+		return resultPath, nil
+	}
+
+	return "/" + strings.TrimPrefix(resultPath, sharedRoot+"/"), nil
+}
+func cleanAlistPath(value string) string {
+	return path.Clean("/" + strings.TrimLeft(value, "/"))
+}
+
+func isAlistPathWithin(parent, target string) bool {
+	return parent == "/" || target == parent || strings.HasPrefix(target, parent+"/")
+}
+
+func hasUnsafeAlistPath(value string) bool {
+	return strings.Contains(value, "\\") || hasParentPathSegment(value)
+}
+
+func hasParentPathSegment(value string) bool {
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func NewAlistUserCache(userID string) *AlistUserCache {
 	return newMapCache(
 		func(ctx context.Context, key string, _ ...struct{}) (*AlistUserCacheData, error) {
@@ -228,7 +289,7 @@ func NewAlistMovieCacheInitFunc(
 			return nil, errors.New("not bind alist vendor")
 		}
 
-		cli := vendor.LoadAlistClient(movie.VendorInfo.Backend)
+		cli := vendor.LoadAlistClient(aucd.Backend)
 
 		fg, err := getFsGet(
 			ctx,
@@ -294,12 +355,10 @@ func getServerIDAndPath(movie *model.Movie, subPath string) (string, string, err
 	}
 
 	if movie.IsFolder {
-		newPath := path.Join(truePath, subPath)
-		if !strings.HasPrefix(newPath, truePath) {
-			return "", "", errors.New("sub path is not in parent path")
+		truePath, err = ResolveAlistPath(truePath, subPath)
+		if err != nil {
+			return "", "", err
 		}
-
-		truePath = newPath
 	}
 
 	return serverID, truePath, nil

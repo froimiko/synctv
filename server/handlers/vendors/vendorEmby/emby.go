@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/synctv-org/synctv/internal/cache"
 	"github.com/synctv-org/synctv/internal/db"
 	dbModel "github.com/synctv-org/synctv/internal/model"
 	"github.com/synctv-org/synctv/internal/op"
@@ -44,33 +45,65 @@ func (s *EmbyVendorService) Client() emby.EmbyHTTPServer {
 	return vendor.LoadEmbyClient(s.movie.VendorInfo.Backend)
 }
 
+type dynamicMovieEmbyCredentials struct {
+	host    string
+	apiKey  string
+	userID  string
+	backend string
+}
+
+func dynamicMovieEmbyCredentialsFromCache(
+	ctx context.Context,
+	creatorCache *cache.EmbyUserCache,
+	serverID string,
+) (*dynamicMovieEmbyCredentials, error) {
+	aucd, err := creatorCache.LoadOrStore(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &dynamicMovieEmbyCredentials{
+		host:    aucd.Host,
+		apiKey:  aucd.APIKey,
+		userID:  aucd.UserID,
+		backend: aucd.Backend,
+	}, nil
+}
+
+func loadDynamicMovieEmbyCredentials(
+	ctx context.Context,
+	creatorID, serverID string,
+) (*dynamicMovieEmbyCredentials, error) {
+	creator, err := op.LoadOrInitUserByID(creatorID)
+	if err != nil {
+		return nil, err
+	}
+
+	return dynamicMovieEmbyCredentialsFromCache(ctx, creator.Value().EmbyCache(), serverID)
+}
+
 //nolint:gosec
 func (s *EmbyVendorService) ListDynamicMovie(
 	ctx context.Context,
-	reqUser *op.User,
+	_ *op.User,
 	subPath, keyword string,
 	page, _max int,
 ) (*model.MovieList, error) {
-	if reqUser.ID != s.movie.CreatorID {
-		return nil, fmt.Errorf("list vendor dynamic folder error: %w", dbModel.ErrNoPermission)
-	}
-
-	user := reqUser
-
 	resp := &model.MovieList{
 		Paths: []*model.MoviePath{},
 	}
 
-	serverID, truePath, err := s.movie.VendorInfo.Emby.ServerIDAndFilePath()
+	serverID, rootItemID, err := s.movie.VendorInfo.Emby.ServerIDAndFilePath()
 	if err != nil {
 		return nil, fmt.Errorf("load emby server id error: %w", err)
 	}
 
+	requestedItemID := rootItemID
 	if subPath != "" {
-		truePath = subPath
+		requestedItemID = subPath
 	}
 
-	aucd, err := user.EmbyCache().LoadOrStore(ctx, serverID)
+	credentials, err := loadDynamicMovieEmbyCredentials(ctx, s.movie.CreatorID, serverID)
 	if err != nil {
 		if errors.Is(err, db.NotFoundError(db.ErrVendorNotFound)) {
 			return nil, errors.New("emby server not found")
@@ -78,11 +111,18 @@ func (s *EmbyVendorService) ListDynamicMovie(
 		return nil, err
 	}
 
-	data, err := s.Client().FsList(ctx, &emby.FsListReq{
-		Host:       aucd.Host,
-		Path:       truePath,
-		Token:      aucd.APIKey,
-		UserId:     aucd.UserID,
+	cli := vendor.LoadEmbyClient(credentials.backend)
+	if err := cache.ValidateEmbyItemInRoot(
+		ctx, cli, credentials.host, credentials.apiKey, rootItemID, requestedItemID,
+	); err != nil {
+		return nil, err
+	}
+
+	data, err := cli.FsList(ctx, &emby.FsListReq{
+		Host:       credentials.host,
+		Path:       requestedItemID,
+		Token:      credentials.apiKey,
+		UserId:     credentials.userID,
 		Limit:      uint64(_max),
 		StartIndex: uint64((page - 1) * _max),
 		SearchTerm: keyword,
@@ -107,7 +147,7 @@ func (s *EmbyVendorService) ListDynamicMovie(
 				ParentID: dbModel.EmptyNullString(s.movie.ID),
 				VendorInfo: dbModel.VendorInfo{
 					Vendor:  dbModel.VendorEmby,
-					Backend: s.movie.VendorInfo.Backend,
+					Backend: credentials.backend,
 					Emby: &dbModel.EmbyStreamingInfo{
 						Path: dbModel.FormatEmbyPath(serverID, flr.GetId()),
 					},
@@ -119,23 +159,45 @@ func (s *EmbyVendorService) ListDynamicMovie(
 	return resp, nil
 }
 
+func shouldProxyEmbyMovie(movie *op.Movie, user *op.User) bool {
+	return movie == nil || user == nil || movie.Proxy || user.ID != movie.CreatorID
+}
+
+func canRequestEmbyProxy(movie *op.Movie, user *op.User) bool {
+	return movie != nil && user != nil && (movie.Proxy || user.ID != movie.CreatorID)
+}
+
+func embySourceCacheKey(source cache.EmbySource) (string, error) {
+	sourceCacheKey, err := url.Parse(source.URL)
+	if err != nil {
+		return "", errors.New("invalid media source")
+	}
+
+	query := sourceCacheKey.Query()
+	query.Del("DeviceId")
+	query.Del("PlaySessionId")
+	sourceCacheKey.RawQuery = query.Encode()
+	return sourceCacheKey.String(), nil
+}
+
 func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 	log := middlewares.GetLogger(ctx)
 
-	if !s.movie.Proxy {
-		log.Errorf("proxy vendor movie error: %v", "proxy is not enabled")
-		ctx.AbortWithStatusJSON(
-			http.StatusBadRequest,
-			model.NewAPIErrorStringResp("proxy is not enabled"),
-		)
-
+	userEntryValue, ok := ctx.Get("user")
+	if !ok {
+		ctx.AbortWithStatusJSON(http.StatusForbidden, model.NewAPIErrorStringResp("proxy access denied"))
+		return
+	}
+	userEntry, ok := userEntryValue.(*op.UserEntry)
+	if !ok || userEntry == nil || !canRequestEmbyProxy(s.movie, userEntry.Value()) {
+		ctx.AbortWithStatusJSON(http.StatusForbidden, model.NewAPIErrorStringResp("proxy access denied"))
 		return
 	}
 
 	source, err := strconv.Atoi(ctx.Query("source"))
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
+		log.Errorf("proxy vendor movie error: invalid source")
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid source"))
 		return
 	}
 	if source < 0 {
@@ -150,14 +212,14 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 	u, err := op.LoadOrInitUserByID(s.movie.CreatorID)
 	if err != nil {
 		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("failed to load media source"))
 		return
 	}
 
 	embyC, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
 	if err != nil {
 		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("failed to load media source"))
 		return
 	}
 
@@ -167,33 +229,21 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		return
 	}
 
-	if source < 0 || source >= len(embyC.Sources) {
+	if source >= len(embyC.Sources) {
 		log.Errorf("proxy vendor movie error: %v", "source out of range")
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
 			model.NewAPIErrorStringResp("source out of range"),
 		)
-
 		return
 	}
 
-	if embyC.Sources[source].IsTranscode {
-		ctx.Redirect(http.StatusFound, embyC.Sources[source].URL)
-		return
-	}
-
-	// ignore DeviceId, PlaySessionId as cache key
-	sourceCacheKey, err := url.Parse(embyC.Sources[source].URL)
+	sourceCacheKey, err := embySourceCacheKey(embyC.Sources[source])
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp(err.Error()))
+		log.Errorf("proxy vendor movie error: invalid media source")
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid media source"))
 		return
 	}
-
-	query := sourceCacheKey.Query()
-	query.Del("DeviceId")
-	query.Del("PlaySessionId")
-	sourceCacheKey.RawQuery = query.Encode()
 
 	err = proxy.AutoProxyURL(ctx,
 		embyC.Sources[source].URL,
@@ -203,7 +253,7 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		s.movie.RoomID,
 		s.movie.ID,
 		proxy.WithProxyURLCache(true),
-		proxy.WithProxyURLCacheKey(sourceCacheKey.String()),
+		proxy.WithProxyURLCacheKey(sourceCacheKey),
 	)
 	if err != nil {
 		log.Errorf("proxy vendor movie error: %v", err)
@@ -288,6 +338,19 @@ func (s *EmbyVendorService) ProxyMovie(ctx *gin.Context) {
 	}
 }
 
+func embyMovieProxyURL(movieID, roomID, userToken string, source int) (string, error) {
+	rawPath, err := url.JoinPath("/api/room/movie/proxy", movieID)
+	if err != nil {
+		return "", err
+	}
+
+	rawQuery := url.Values{}
+	rawQuery.Set("source", strconv.Itoa(source))
+	rawQuery.Set("token", userToken)
+	rawQuery.Set("roomId", roomID)
+	return (&url.URL{Path: rawPath, RawQuery: rawQuery.Encode()}).String(), nil
+}
+
 func embySubtitleProxyURL(movieID, roomID, userToken string, source, id int) (string, error) {
 	rawPath, err := url.JoinPath("/api/room/movie/proxy", movieID)
 	if err != nil {
@@ -309,7 +372,7 @@ func (s *EmbyVendorService) GenMovieInfo(
 	user *op.User,
 	userAgent, userToken string,
 ) (*dbModel.Movie, error) {
-	if s.movie.Proxy {
+	if shouldProxyEmbyMovie(s.movie, user) {
 		return s.GenProxyMovieInfo(ctx, user, userAgent, userToken)
 	}
 
@@ -375,14 +438,80 @@ func (s *EmbyVendorService) GenMovieInfo(
 	return movie, nil
 }
 
+func rebuildEmbyProxyMovie(
+	movie *dbModel.Movie,
+	sources []cache.EmbySource,
+	userToken string,
+) (*dbModel.Movie, error) {
+	if movie == nil {
+		return nil, errors.New("movie is required")
+	}
+
+	movie.URL = ""
+	movie.MoreSources = nil
+	movie.Headers = nil
+	movie.Subtitles = nil
+
+	hasSource := false
+	for sourceIndex, source := range sources {
+		if source.URL == "" {
+			continue
+		}
+
+		proxyURL, err := embyMovieProxyURL(movie.ID, movie.RoomID, userToken, sourceIndex)
+		if err != nil {
+			return nil, err
+		}
+
+		sourceType := utils.GetURLExtension(source.URL)
+		if !hasSource {
+			movie.URL = proxyURL
+			movie.Type = sourceType
+			hasSource = true
+		} else {
+			movie.MoreSources = append(movie.MoreSources, &dbModel.MoreSource{
+				Name: source.Name,
+				URL:  proxyURL,
+				Type: sourceType,
+			})
+		}
+
+		for subtitleIndex, subtitle := range source.Subtitles {
+			if movie.Subtitles == nil {
+				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(source.Subtitles))
+			}
+
+			subtitleURL, err := embySubtitleProxyURL(
+				movie.ID,
+				movie.RoomID,
+				userToken,
+				sourceIndex,
+				subtitleIndex,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			movie.Subtitles[subtitle.Name] = &dbModel.Subtitle{
+				URL:  subtitleURL,
+				Type: subtitle.Type,
+			}
+		}
+	}
+
+	if !hasSource {
+		return nil, errors.New("no source")
+	}
+
+	return movie, nil
+}
+
 func (s *EmbyVendorService) GenProxyMovieInfo(
 	ctx context.Context,
 	_ *op.User,
 	_, userToken string,
 ) (*dbModel.Movie, error) {
 	movie := s.movie.Clone()
-
-	var err error
 
 	u, err := op.LoadOrInitUserByID(movie.CreatorID)
 	if err != nil {
@@ -391,73 +520,8 @@ func (s *EmbyVendorService) GenProxyMovieInfo(
 
 	data, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
 	if err != nil {
-		return nil, err
+		return nil, errors.New("failed to load media source")
 	}
 
-	for si, es := range data.Sources {
-		if len(es.URL) == 0 {
-			if si != len(data.Sources)-1 {
-				continue
-			}
-
-			if movie.URL == "" {
-				return nil, errors.New("no source")
-			}
-		}
-
-		rawPath, err := url.JoinPath("/api/room/movie/proxy", movie.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		rawQuery := url.Values{}
-		rawQuery.Set("source", strconv.Itoa(si))
-		rawQuery.Set("token", userToken)
-		rawQuery.Set("roomId", movie.RoomID)
-		u := url.URL{
-			Path:     rawPath,
-			RawQuery: rawQuery.Encode(),
-		}
-
-		if si == 0 {
-			movie.URL = u.String()
-			movie.Type = utils.GetURLExtension(es.URL)
-		} else {
-			movie.MoreSources = append(movie.MoreSources,
-				&dbModel.MoreSource{
-					Name: es.Name,
-					URL:  u.String(),
-					Type: utils.GetURLExtension(es.URL),
-				},
-			)
-		}
-
-		if len(es.Subtitles) == 0 {
-			continue
-		}
-
-		for sbi, s := range es.Subtitles {
-			if movie.Subtitles == nil {
-				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(es.Subtitles))
-			}
-
-			subtitleURL, err := embySubtitleProxyURL(
-				movie.ID,
-				movie.RoomID,
-				userToken,
-				si,
-				sbi,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			movie.Subtitles[s.Name] = &dbModel.Subtitle{
-				URL:  subtitleURL,
-				Type: s.Type,
-			}
-		}
-	}
-
-	return movie, nil
+	return rebuildEmbyProxyMovie(movie, data.Sources, userToken)
 }

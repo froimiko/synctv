@@ -100,35 +100,45 @@ func fmtContentLength(start, end, total int64) string {
 	return strconv.FormatInt(length, 10)
 }
 
-// ServeHTTP implements http.Handler interface
-func (c *SliceCacheProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	_ = c.Proxy(w, r)
+type responseWriteState struct {
+	http.ResponseWriter
+	written bool
 }
 
+func (w *responseWriteState) WriteHeader(statusCode int) {
+	w.written = true
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *responseWriteState) Write(data []byte) (int, error) {
+	w.written = true
+	return w.ResponseWriter.Write(data)
+}
+
+// ServeHTTP implements http.Handler interface
+func (c *SliceCacheProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	state := &responseWriteState{ResponseWriter: w}
+	if err := c.Proxy(state, r); err != nil && !state.written {
+		http.Error(state, errFailedToProxyMedia.Error(), http.StatusBadGateway)
+	}
+}
 func (c *SliceCacheProxy) Proxy(w http.ResponseWriter, r *http.Request) error {
 	byteRange, err := ParseByteRange(r.Header.Get("Range"))
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse Range header: %v", err), http.StatusBadRequest)
-		return fmt.Errorf("failed to parse Range header: %w", err)
+		return err
 	}
 
 	alignedOffset := alignedOffset(byteRange.Start, c.sliceSize)
 
 	cacheItem, cached, err := c.getCacheItem(alignedOffset)
 	if err != nil {
-		http.Error(
-			w,
-			fmt.Sprintf("Failed to get cache item: %v", err),
-			http.StatusInternalServerError,
-		)
-
-		return fmt.Errorf("failed to get cache item: %w", err)
+		return err
 	}
 
 	c.setResponseHeaders(w, byteRange, cacheItem, cached, r.Header.Get("Range") != "")
 
 	if err := c.writeResponse(w, byteRange, alignedOffset, cacheItem); err != nil {
-		return fmt.Errorf("failed to write response: %w", err)
+		return err
 	}
 
 	return nil

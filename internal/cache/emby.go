@@ -31,6 +31,59 @@ type EmbyUserCacheData struct {
 	Backend  string
 }
 
+type embyItemGetter interface {
+	GetItem(context.Context, *emby.GetItemReq) (*emby.Item, error)
+}
+
+const maxEmbyParentDepth = 128
+
+var errEmbyItemOutsideRoot = errors.New("emby item is not in shared root")
+
+func ValidateEmbyItemInRoot(
+	ctx context.Context,
+	cli embyItemGetter,
+	host, token, rootItemID, requestedItemID string,
+) error {
+	if cli == nil || rootItemID == "" || requestedItemID == "" {
+		return errEmbyItemOutsideRoot
+	}
+	if requestedItemID == rootItemID {
+		return nil
+	}
+
+	visited := make(map[string]struct{}, maxEmbyParentDepth)
+	currentItemID := requestedItemID
+	for depth := 0; depth < maxEmbyParentDepth; depth++ {
+		if _, ok := visited[currentItemID]; ok {
+			return errEmbyItemOutsideRoot
+		}
+		visited[currentItemID] = struct{}{}
+
+		item, err := cli.GetItem(ctx, &emby.GetItemReq{
+			Host:   host,
+			Token:  token,
+			ItemId: currentItemID,
+		})
+		if err != nil || item == nil {
+			return errEmbyItemOutsideRoot
+		}
+		if item.GetId() != "" && item.GetId() != currentItemID {
+			return errEmbyItemOutsideRoot
+		}
+
+		parentItemID := item.GetParentId()
+		if parentItemID == "" {
+			return errEmbyItemOutsideRoot
+		}
+		if parentItemID == rootItemID {
+			return nil
+		}
+		currentItemID = parentItemID
+	}
+
+	return errEmbyItemOutsideRoot
+}
+
 func NewEmbyUserCache(userID string) *EmbyUserCache {
 	return newMapCache0(func(_ context.Context, key string) (*EmbyUserCacheData, error) {
 		return EmbyAuthorizationCacheWithUserIDInitFunc(userID, key)
@@ -143,7 +196,7 @@ func NewEmbyMovieCacheInitFunc(
 			return nil, err
 		}
 
-		serverID, truePath, err := getEmbyServerIDAndPath(movie, subPath)
+		serverID, rootItemID, requestedItemID, err := getEmbyServerIDAndPath(movie, subPath)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +210,14 @@ func NewEmbyMovieCacheInitFunc(
 			return nil, errors.New("not bind emby vendor")
 		}
 
-		data, err := getPlaybackInfo(ctx, aucd, truePath)
+		cli := vendor.LoadEmbyClient(aucd.Backend)
+		if err := ValidateEmbyItemInRoot(
+			ctx, cli, aucd.Host, aucd.APIKey, rootItemID, requestedItemID,
+		); err != nil {
+			return nil, err
+		}
+
+		data, err := getPlaybackInfo(ctx, cli, aucd, requestedItemID)
 		if err != nil {
 			return nil, err
 		}
@@ -173,14 +233,14 @@ func NewEmbyMovieCacheInitFunc(
 		}
 
 		for i, v := range data.GetMediaSourceInfo() {
-			source, err := processMediaSource(v, movie, aucd, truePath, u)
+			source, err := processMediaSource(v, movie, aucd, requestedItemID, u)
 			if err != nil {
 				return nil, err
 			}
 
 			if source != nil {
 				resp.Sources[i] = *source
-				resp.Sources[i].Subtitles = processEmbySubtitles(v, truePath, aucd.APIKey, u)
+				resp.Sources[i].Subtitles = processEmbySubtitles(v, requestedItemID, aucd.APIKey, u)
 			}
 		}
 		return resp, nil
@@ -199,26 +259,26 @@ func validateEmbyArgs(args *EmbyUserCache, movie *model.Movie, subPath string) e
 	return nil
 }
 
-func getEmbyServerIDAndPath(movie *model.Movie, subPath string) (string, string, error) {
-	serverID, truePath, err := movie.VendorInfo.Emby.ServerIDAndFilePath()
+func getEmbyServerIDAndPath(movie *model.Movie, subPath string) (string, string, string, error) {
+	serverID, rootItemID, err := movie.VendorInfo.Emby.ServerIDAndFilePath()
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
+	requestedItemID := rootItemID
 	if movie.IsFolder {
-		truePath = subPath
+		requestedItemID = subPath
 	}
 
-	return serverID, truePath, nil
+	return serverID, rootItemID, requestedItemID, nil
 }
 
 func getPlaybackInfo(
 	ctx context.Context,
+	cli emby.EmbyHTTPServer,
 	aucd *EmbyUserCacheData,
 	truePath string,
 ) (*emby.PlaybackInfoResp, error) {
-	cli := vendor.LoadEmbyClient(aucd.Backend)
-
 	data, err := cli.PlaybackInfo(ctx, &emby.PlaybackInfoReq{
 		Host:   aucd.Host,
 		Token:  aucd.APIKey,

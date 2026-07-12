@@ -353,10 +353,6 @@ func listVendorDynamicMovie(
 	subPath, keyword string,
 	page, _max int,
 ) (*model.MoviesResp, error) {
-	if reqUser.ID != movie.CreatorID {
-		return nil, fmt.Errorf("list vendor dynamic folder error: %w", dbModel.ErrNoPermission)
-	}
-
 	paths, err := getParentMoviePath(room, movie.ID)
 	if err != nil {
 		return nil, fmt.Errorf("get parent movie path error: %w", err)

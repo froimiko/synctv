@@ -37,13 +37,39 @@ type embyItemGetter interface {
 
 var errEmbyItemOutsideRoot = errors.New("emby item is not in shared root")
 
+type embyRootValidationError struct {
+	category string
+}
+
+func (e *embyRootValidationError) Error() string { return errEmbyItemOutsideRoot.Error() }
+func (e *embyRootValidationError) Unwrap() error { return errEmbyItemOutsideRoot }
+
+func newEmbyRootValidationError(category string) error {
+	return &embyRootValidationError{category: category}
+}
+
+func EmbyRootValidationCategory(err error) string {
+	var validationErr *embyRootValidationError
+	if errors.As(err, &validationErr) {
+		return validationErr.category
+	}
+	return "unknown"
+}
+
 func ValidateEmbyItemInRoot(
 	ctx context.Context,
 	cli embyItemGetter,
 	host, token, userID, rootItemID, requestedItemID string,
 ) error {
-	if cli == nil || userID == "" || rootItemID == "" || requestedItemID == "" {
-		return errEmbyItemOutsideRoot
+	switch {
+	case cli == nil:
+		return newEmbyRootValidationError("missing_client")
+	case userID == "":
+		return newEmbyRootValidationError("missing_user_id")
+	case rootItemID == "":
+		return newEmbyRootValidationError("missing_root_id")
+	case requestedItemID == "":
+		return newEmbyRootValidationError("missing_item_id")
 	}
 	if requestedItemID == rootItemID {
 		return nil
@@ -56,11 +82,17 @@ func ValidateEmbyItemInRoot(
 		ItemId:     requestedItemID,
 		RootItemId: rootItemID,
 	})
-	if err != nil || item == nil {
-		return errEmbyItemOutsideRoot
+	if err != nil {
+		return newEmbyRootValidationError("backend_error")
 	}
-	if item.GetId() != requestedItemID || item.GetParentId() != rootItemID {
-		return errEmbyItemOutsideRoot
+	if item == nil {
+		return newEmbyRootValidationError("nil_response")
+	}
+	if item.GetId() != requestedItemID {
+		return newEmbyRootValidationError("proof_id_mismatch")
+	}
+	if item.GetParentId() != rootItemID {
+		return newEmbyRootValidationError("proof_root_mismatch")
 	}
 
 	return nil
@@ -196,6 +228,14 @@ func NewEmbyMovieCacheInitFunc(
 		if err := ValidateEmbyItemInRoot(
 			ctx, cli, aucd.Host, aucd.APIKey, aucd.UserID, rootItemID, requestedItemID,
 		); err != nil {
+			backendKind := "local"
+			if aucd.Backend != "" {
+				backendKind = "remote"
+			}
+			log.WithFields(log.Fields{
+				"category":     EmbyRootValidationCategory(err),
+				"backend_kind": backendKind,
+			}).Warn("emby shared-root validation rejected")
 			return nil, err
 		}
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/cache"
 	"github.com/synctv-org/synctv/internal/db"
 	dbModel "github.com/synctv-org/synctv/internal/model"
@@ -115,6 +116,14 @@ func (s *EmbyVendorService) ListDynamicMovie(
 	if err := cache.ValidateEmbyItemInRoot(
 		ctx, cli, credentials.host, credentials.apiKey, credentials.userID, rootItemID, requestedItemID,
 	); err != nil {
+		backendKind := "local"
+		if credentials.backend != "" {
+			backendKind = "remote"
+		}
+		log.WithFields(log.Fields{
+			"category":     cache.EmbyRootValidationCategory(err),
+			"backend_kind": backendKind,
+		}).Warn("emby shared-root validation rejected")
 		return nil, err
 	}
 

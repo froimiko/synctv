@@ -167,6 +167,43 @@ func TestValidateEmbyItemInRoot(t *testing.T) {
 	}
 }
 
+func TestEmbyRootValidationCategory(t *testing.T) {
+	tests := []struct {
+		name     string
+		cli      embyItemGetter
+		userID   string
+		rootID   string
+		itemID   string
+		category string
+	}{
+		{name: "missing client", userID: testEmbyUserID, rootID: "root", itemID: "item", category: "missing_client"},
+		{name: "missing user", cli: &fakeEmbyItemGetter{}, rootID: "root", itemID: "item", category: "missing_user_id"},
+		{name: "missing root", cli: &fakeEmbyItemGetter{}, userID: testEmbyUserID, itemID: "item", category: "missing_root_id"},
+		{name: "missing item", cli: &fakeEmbyItemGetter{}, userID: testEmbyUserID, rootID: "root", category: "missing_item_id"},
+		{name: "backend error", cli: &fakeEmbyItemGetter{err: errors.New("sensitive upstream detail")}, userID: testEmbyUserID, rootID: "root", itemID: "item", category: "backend_error"},
+		{name: "nil response", cli: &fakeEmbyItemGetter{}, userID: testEmbyUserID, rootID: "root", itemID: "item", category: "nil_response"},
+		{name: "ID mismatch", cli: &fakeEmbyItemGetter{item: &emby.Item{Id: "other", ParentId: "root"}}, userID: testEmbyUserID, rootID: "root", itemID: "item", category: "proof_id_mismatch"},
+		{name: "root mismatch", cli: &fakeEmbyItemGetter{item: &emby.Item{Id: "item", ParentId: "other"}}, userID: testEmbyUserID, rootID: "root", itemID: "item", category: "proof_root_mismatch"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateEmbyItemInRoot(context.Background(), tt.cli, testEmbyHost, testEmbyToken, tt.userID, tt.rootID, tt.itemID)
+			if !errors.Is(err, errEmbyItemOutsideRoot) {
+				t.Fatalf("error = %v, want shared-root rejection", err)
+			}
+			if got := EmbyRootValidationCategory(err); got != tt.category {
+				t.Fatalf("category = %q, want %q", got, tt.category)
+			}
+			for _, sensitive := range []string{testEmbyHost, testEmbyToken, "sensitive upstream detail", tt.userID, tt.rootID, tt.itemID} {
+				if sensitive != "" && strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("validation error leaked sensitive value")
+				}
+			}
+		})
+	}
+}
+
 func TestValidateEmbyItemInRootRejectsMissingRequiredContext(t *testing.T) {
 	tests := []struct {
 		name        string

@@ -113,7 +113,7 @@ func (s *EmbyVendorService) ListDynamicMovie(
 
 	cli := vendor.LoadEmbyClient(credentials.backend)
 	if err := cache.ValidateEmbyItemInRoot(
-		ctx, cli, credentials.host, credentials.apiKey, rootItemID, requestedItemID,
+		ctx, cli, credentials.host, credentials.apiKey, credentials.userID, rootItemID, requestedItemID,
 	); err != nil {
 		return nil, err
 	}

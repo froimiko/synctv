@@ -42,9 +42,9 @@ var errEmbyItemOutsideRoot = errors.New("emby item is not in shared root")
 func ValidateEmbyItemInRoot(
 	ctx context.Context,
 	cli embyItemGetter,
-	host, token, rootItemID, requestedItemID string,
+	host, token, userID, rootItemID, requestedItemID string,
 ) error {
-	if cli == nil || rootItemID == "" || requestedItemID == "" {
+	if cli == nil || userID == "" || rootItemID == "" || requestedItemID == "" {
 		return errEmbyItemOutsideRoot
 	}
 	if requestedItemID == rootItemID {
@@ -62,12 +62,13 @@ func ValidateEmbyItemInRoot(
 		item, err := cli.GetItem(ctx, &emby.GetItemReq{
 			Host:   host,
 			Token:  token,
+			UserId: userID,
 			ItemId: currentItemID,
 		})
 		if err != nil || item == nil {
 			return errEmbyItemOutsideRoot
 		}
-		if item.GetId() != "" && item.GetId() != currentItemID {
+		if item.GetId() != currentItemID {
 			return errEmbyItemOutsideRoot
 		}
 
@@ -212,7 +213,7 @@ func NewEmbyMovieCacheInitFunc(
 
 		cli := vendor.LoadEmbyClient(aucd.Backend)
 		if err := ValidateEmbyItemInRoot(
-			ctx, cli, aucd.Host, aucd.APIKey, rootItemID, requestedItemID,
+			ctx, cli, aucd.Host, aucd.APIKey, aucd.UserID, rootItemID, requestedItemID,
 		); err != nil {
 			return nil, err
 		}

@@ -35,8 +35,6 @@ type embyItemGetter interface {
 	GetItem(context.Context, *emby.GetItemReq) (*emby.Item, error)
 }
 
-const maxEmbyParentDepth = 128
-
 var errEmbyItemOutsideRoot = errors.New("emby item is not in shared root")
 
 func ValidateEmbyItemInRoot(
@@ -51,38 +49,21 @@ func ValidateEmbyItemInRoot(
 		return nil
 	}
 
-	visited := make(map[string]struct{}, maxEmbyParentDepth)
-	currentItemID := requestedItemID
-	for depth := 0; depth < maxEmbyParentDepth; depth++ {
-		if _, ok := visited[currentItemID]; ok {
-			return errEmbyItemOutsideRoot
-		}
-		visited[currentItemID] = struct{}{}
-
-		item, err := cli.GetItem(ctx, &emby.GetItemReq{
-			Host:   host,
-			Token:  token,
-			UserId: userID,
-			ItemId: currentItemID,
-		})
-		if err != nil || item == nil {
-			return errEmbyItemOutsideRoot
-		}
-		if item.GetId() != currentItemID {
-			return errEmbyItemOutsideRoot
-		}
-
-		parentItemID := item.GetParentId()
-		if parentItemID == "" {
-			return errEmbyItemOutsideRoot
-		}
-		if parentItemID == rootItemID {
-			return nil
-		}
-		currentItemID = parentItemID
+	item, err := cli.GetItem(ctx, &emby.GetItemReq{
+		Host:       host,
+		Token:      token,
+		UserId:     userID,
+		ItemId:     requestedItemID,
+		RootItemId: rootItemID,
+	})
+	if err != nil || item == nil {
+		return errEmbyItemOutsideRoot
+	}
+	if item.GetId() != requestedItemID || item.GetParentId() != rootItemID {
+		return errEmbyItemOutsideRoot
 	}
 
-	return errEmbyItemOutsideRoot
+	return nil
 }
 
 func NewEmbyUserCache(userID string) *EmbyUserCache {

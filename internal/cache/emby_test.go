@@ -3,7 +3,6 @@ package cache
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,7 +19,7 @@ const (
 )
 
 type fakeEmbyItemGetter struct {
-	items    map[string]*emby.Item
+	item     *emby.Item
 	err      error
 	requests []*emby.GetItemReq
 }
@@ -30,36 +29,42 @@ func (f *fakeEmbyItemGetter) GetItem(
 	req *emby.GetItemReq,
 ) (*emby.Item, error) {
 	f.requests = append(f.requests, &emby.GetItemReq{
-		Host:   req.GetHost(),
-		Token:  req.GetToken(),
-		ItemId: req.GetItemId(),
-		UserId: req.GetUserId(),
+		Host:       req.GetHost(),
+		Token:      req.GetToken(),
+		ItemId:     req.GetItemId(),
+		UserId:     req.GetUserId(),
+		RootItemId: req.GetRootItemId(),
 	})
 	if f.err != nil {
 		return nil, f.err
 	}
-	return f.items[req.GetItemId()], nil
+	return f.item, nil
 }
 
-func assertEmbyItemRequests(t *testing.T, requests []*emby.GetItemReq, wantItemIDs []string) {
+func assertEmbyReachabilityRequest(
+	t *testing.T,
+	requests []*emby.GetItemReq,
+	rootItemID, requestedItemID string,
+) {
 	t.Helper()
-
-	if len(requests) != len(wantItemIDs) {
-		t.Fatalf("GetItem calls = %d, want %d", len(requests), len(wantItemIDs))
+	if len(requests) != 1 {
+		t.Fatalf("GetItem calls = %d, want 1", len(requests))
 	}
-	for i, req := range requests {
-		if got := req.GetHost(); got != testEmbyHost {
-			t.Errorf("request %d host = %q, want %q", i, got, testEmbyHost)
-		}
-		if got := req.GetToken(); got != testEmbyToken {
-			t.Errorf("request %d token mismatch", i)
-		}
-		if got := req.GetUserId(); got != testEmbyUserID {
-			t.Errorf("request %d user ID = %q, want %q", i, got, testEmbyUserID)
-		}
-		if got := req.GetItemId(); got != wantItemIDs[i] {
-			t.Errorf("request %d item ID = %q, want %q", i, got, wantItemIDs[i])
-		}
+	req := requests[0]
+	if got := req.GetHost(); got != testEmbyHost {
+		t.Errorf("host = %q, want %q", got, testEmbyHost)
+	}
+	if got := req.GetToken(); got != testEmbyToken {
+		t.Errorf("token mismatch")
+	}
+	if got := req.GetUserId(); got != testEmbyUserID {
+		t.Errorf("user ID = %q, want %q", got, testEmbyUserID)
+	}
+	if got := req.GetRootItemId(); got != rootItemID {
+		t.Errorf("root item ID = %q, want %q", got, rootItemID)
+	}
+	if got := req.GetItemId(); got != requestedItemID {
+		t.Errorf("item ID = %q, want %q", got, requestedItemID)
 	}
 }
 
@@ -68,129 +73,73 @@ func TestValidateEmbyItemInRoot(t *testing.T) {
 		name        string
 		rootItemID  string
 		requestedID string
-		items       map[string]*emby.Item
+		item        *emby.Item
 		getItemErr  error
 		wantErr     bool
-		wantItemIDs []string
+		wantCalls   int
 	}{
+		{name: "root itself", rootItemID: "root", requestedID: "root"},
+		{name: "empty root", requestedID: "child", wantErr: true},
+		{name: "empty request", rootItemID: "root", wantErr: true},
 		{
-			name:        "root itself",
-			rootItemID:  "root",
-			requestedID: "root",
-		},
-		{
-			name:        "empty root",
-			requestedID: "child",
-			wantErr:     true,
-		},
-		{
-			name:       "empty request",
-			rootItemID: "root",
-			wantErr:    true,
-		},
-		{
-			name:        "direct descendant",
-			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {Id: "child", ParentId: "root"},
-			},
-			wantItemIDs: []string{"child"},
-		},
-		{
-			name:        "third level playable media descendant",
+			name:        "virtual root deep descendant proof",
 			rootItemID:  "root",
 			requestedID: "episode",
-			items: map[string]*emby.Item{
-				"episode": {Id: "episode", ParentId: "season"},
-				"season":  {Id: "season", ParentId: "series"},
-				"series":  {Id: "series", ParentId: "root"},
-			},
-			wantItemIDs: []string{"episode", "season", "series"},
+			item:        &emby.Item{Id: "episode", ParentId: "root"},
+			wantCalls:   1,
 		},
 		{
-			name:        "unrelated root",
+			name:        "wrong root proof",
 			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {Id: "child", ParentId: "other"},
-				"other": {Id: "other"},
-			},
+			requestedID: "episode",
+			item:        &emby.Item{Id: "episode", ParentId: "other-root"},
 			wantErr:     true,
-			wantItemIDs: []string{"child", "other"},
+			wantCalls:   1,
 		},
 		{
-			name:        "empty parent",
+			name:        "empty root proof",
 			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {Id: "child"},
-			},
+			requestedID: "episode",
+			item:        &emby.Item{Id: "episode"},
 			wantErr:     true,
-			wantItemIDs: []string{"child"},
-		},
-		{
-			name:        "cycle",
-			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child":  {Id: "child", ParentId: "parent"},
-				"parent": {Id: "parent", ParentId: "child"},
-			},
-			wantErr:     true,
-			wantItemIDs: []string{"child", "parent"},
-		},
-		{
-			name:        "self-parent cycle",
-			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {Id: "child", ParentId: "child"},
-			},
-			wantErr:     true,
-			wantItemIDs: []string{"child"},
+			wantCalls:   1,
 		},
 		{
 			name:        "returned ID mismatch",
 			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {Id: "different", ParentId: "root"},
-			},
+			requestedID: "episode",
+			item:        &emby.Item{Id: "different", ParentId: "root"},
 			wantErr:     true,
-			wantItemIDs: []string{"child"},
+			wantCalls:   1,
 		},
 		{
 			name:        "returned empty ID",
 			rootItemID:  "root",
-			requestedID: "child",
-			items: map[string]*emby.Item{
-				"child": {ParentId: "root"},
-			},
+			requestedID: "episode",
+			item:        &emby.Item{ParentId: "root"},
 			wantErr:     true,
-			wantItemIDs: []string{"child"},
+			wantCalls:   1,
 		},
 		{
-			name:        "GetItem error",
+			name:        "upstream error",
 			rootItemID:  "root",
-			requestedID: "child",
+			requestedID: "episode",
 			getItemErr:  errors.New("upstream failure"),
 			wantErr:     true,
-			wantItemIDs: []string{"child"},
+			wantCalls:   1,
 		},
 		{
 			name:        "nil item",
 			rootItemID:  "root",
-			requestedID: "missing",
-			items:       map[string]*emby.Item{},
+			requestedID: "episode",
 			wantErr:     true,
-			wantItemIDs: []string{"missing"},
+			wantCalls:   1,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cli := &fakeEmbyItemGetter{items: tt.items, err: tt.getItemErr}
+			cli := &fakeEmbyItemGetter{item: tt.item, err: tt.getItemErr}
 			err := ValidateEmbyItemInRoot(
 				context.Background(), cli, testEmbyHost, testEmbyToken, testEmbyUserID,
 				tt.rootItemID, tt.requestedID,
@@ -201,7 +150,12 @@ func TestValidateEmbyItemInRoot(t *testing.T) {
 			if tt.wantErr && !errors.Is(err, errEmbyItemOutsideRoot) {
 				t.Fatalf("error = %v, want shared-root rejection", err)
 			}
-			assertEmbyItemRequests(t, cli.requests, tt.wantItemIDs)
+			if len(cli.requests) != tt.wantCalls {
+				t.Fatalf("GetItem calls = %d, want %d", len(cli.requests), tt.wantCalls)
+			}
+			if tt.wantCalls == 1 {
+				assertEmbyReachabilityRequest(t, cli.requests, tt.rootItemID, tt.requestedID)
+			}
 			if err != nil {
 				for _, sensitive := range []string{testEmbyHost, testEmbyToken} {
 					if strings.Contains(err.Error(), sensitive) {
@@ -214,95 +168,32 @@ func TestValidateEmbyItemInRoot(t *testing.T) {
 }
 
 func TestValidateEmbyItemInRootRejectsMissingRequiredContext(t *testing.T) {
-	t.Run("nil client", func(t *testing.T) {
-		err := ValidateEmbyItemInRoot(
-			context.Background(), nil, testEmbyHost, testEmbyToken, testEmbyUserID,
-			"root", "child",
-		)
-		if !errors.Is(err, errEmbyItemOutsideRoot) {
-			t.Fatalf("error = %v, want shared-root rejection", err)
-		}
-	})
+	tests := []struct {
+		name        string
+		cli         embyItemGetter
+		userID      string
+		rootItemID  string
+		requestedID string
+	}{
+		{name: "nil client", userID: testEmbyUserID, rootItemID: "root", requestedID: "child"},
+		{name: "empty user ID", cli: &fakeEmbyItemGetter{}, rootItemID: "root", requestedID: "child"},
+		{name: "empty user ID rejects root itself", cli: &fakeEmbyItemGetter{}, rootItemID: "root", requestedID: "root"},
+	}
 
-	t.Run("empty user ID", func(t *testing.T) {
-		cli := &fakeEmbyItemGetter{}
-		err := ValidateEmbyItemInRoot(
-			context.Background(), cli, testEmbyHost, testEmbyToken, "",
-			"root", "child",
-		)
-		if !errors.Is(err, errEmbyItemOutsideRoot) {
-			t.Fatalf("error = %v, want shared-root rejection", err)
-		}
-		if len(cli.requests) != 0 {
-			t.Fatalf("GetItem calls = %d, want 0", len(cli.requests))
-		}
-	})
-
-	t.Run("empty user ID rejects root itself", func(t *testing.T) {
-		cli := &fakeEmbyItemGetter{}
-		err := ValidateEmbyItemInRoot(
-			context.Background(), cli, testEmbyHost, testEmbyToken, "",
-			"root", "root",
-		)
-		if !errors.Is(err, errEmbyItemOutsideRoot) {
-			t.Fatalf("error = %v, want shared-root rejection", err)
-		}
-		if len(cli.requests) != 0 {
-			t.Fatalf("GetItem calls = %d, want 0", len(cli.requests))
-		}
-	})
-}
-
-func TestValidateEmbyItemInRootEnforcesMaximumDepth(t *testing.T) {
-	t.Run("root reached on maximum query", func(t *testing.T) {
-		items := make(map[string]*emby.Item, maxEmbyParentDepth)
-		wantItemIDs := make([]string, maxEmbyParentDepth)
-		for depth := 0; depth < maxEmbyParentDepth; depth++ {
-			itemID := fmt.Sprintf("node-%03d", depth)
-			parentID := fmt.Sprintf("node-%03d", depth+1)
-			if depth == maxEmbyParentDepth-1 {
-				parentID = "root"
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateEmbyItemInRoot(
+				context.Background(), tt.cli, testEmbyHost, testEmbyToken, tt.userID,
+				tt.rootItemID, tt.requestedID,
+			)
+			if !errors.Is(err, errEmbyItemOutsideRoot) {
+				t.Fatalf("error = %v, want shared-root rejection", err)
 			}
-			items[itemID] = &emby.Item{Id: itemID, ParentId: parentID}
-			wantItemIDs[depth] = itemID
-		}
-
-		cli := &fakeEmbyItemGetter{items: items}
-		err := ValidateEmbyItemInRoot(
-			context.Background(), cli, testEmbyHost, testEmbyToken, testEmbyUserID,
-			"root", wantItemIDs[0],
-		)
-		if err != nil {
-			t.Fatalf("error = %v, want acceptance", err)
-		}
-		assertEmbyItemRequests(t, cli.requests, wantItemIDs)
-	})
-
-	t.Run("root requires query beyond maximum", func(t *testing.T) {
-		items := make(map[string]*emby.Item, maxEmbyParentDepth+1)
-		wantItemIDs := make([]string, maxEmbyParentDepth)
-		for depth := 0; depth <= maxEmbyParentDepth; depth++ {
-			itemID := fmt.Sprintf("node-%03d", depth)
-			parentID := fmt.Sprintf("node-%03d", depth+1)
-			if depth == maxEmbyParentDepth {
-				parentID = "root"
+			if cli, ok := tt.cli.(*fakeEmbyItemGetter); ok && len(cli.requests) != 0 {
+				t.Fatalf("GetItem calls = %d, want 0", len(cli.requests))
 			}
-			items[itemID] = &emby.Item{Id: itemID, ParentId: parentID}
-			if depth < maxEmbyParentDepth {
-				wantItemIDs[depth] = itemID
-			}
-		}
-
-		cli := &fakeEmbyItemGetter{items: items}
-		err := ValidateEmbyItemInRoot(
-			context.Background(), cli, testEmbyHost, testEmbyToken, testEmbyUserID,
-			"root", wantItemIDs[0],
-		)
-		if !errors.Is(err, errEmbyItemOutsideRoot) {
-			t.Fatalf("error = %v, want shared-root rejection", err)
-		}
-		assertEmbyItemRequests(t, cli.requests, wantItemIDs)
-	})
+		})
+	}
 }
 
 func TestProcessEmbySubtitlesBuildsIndependentAuthenticatedURLs(t *testing.T) {

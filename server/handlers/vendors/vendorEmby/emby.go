@@ -234,11 +234,11 @@ func (s *EmbyVendorService) ListDynamicMovie(
 }
 
 func shouldProxyEmbyMovie(movie *op.Movie, user *op.User) bool {
-	return movie == nil || user == nil || movie.Proxy || user.ID != movie.CreatorID
+	return movie == nil || user == nil || movie.Proxy
 }
 
 func canRequestEmbyProxy(movie *op.Movie, user *op.User) bool {
-	return movie != nil && user != nil && (movie.Proxy || user.ID != movie.CreatorID)
+	return movie != nil && user != nil && movie.Proxy
 }
 
 func embySourceCacheKey(source cache.EmbySource) (string, error) {
@@ -481,6 +481,9 @@ func (s *EmbyVendorService) GenMovieInfo(
 	user *op.User,
 	userAgent, userToken string,
 ) (*dbModel.Movie, error) {
+	if s == nil || s.movie == nil || user == nil {
+		return nil, errors.New("invalid emby movie context")
+	}
 	if shouldProxyEmbyMovie(s.movie, user) {
 		return s.GenProxyMovieInfo(ctx, user, userAgent, userToken)
 	}
@@ -610,9 +613,12 @@ func rebuildEmbyProxyMovie(
 
 func (s *EmbyVendorService) GenProxyMovieInfo(
 	ctx context.Context,
-	_ *op.User,
+	user *op.User,
 	_, userToken string,
 ) (*dbModel.Movie, error) {
+	if s == nil || s.movie == nil || user == nil {
+		return nil, errors.New("invalid emby movie context")
+	}
 	movie := s.movie.Clone()
 
 	data, err := s.embyMovieCacheData(ctx)

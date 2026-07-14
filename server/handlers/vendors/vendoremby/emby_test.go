@@ -123,11 +123,14 @@ func TestEmbyProxyDecisions(t *testing.T) {
 	if shouldProxyEmbyMovie(directMovie, creator) {
 		t.Fatal("creator should keep direct playback when proxy is disabled")
 	}
-	if !shouldProxyEmbyMovie(directMovie, guest) {
-		t.Fatal("non-creator must use the SyncTV proxy")
+	if shouldProxyEmbyMovie(directMovie, guest) {
+		t.Fatal("guest should keep direct playback when proxy is disabled")
 	}
 	if !shouldProxyEmbyMovie(proxyMovie, creator) {
 		t.Fatal("proxy-enabled movie must use the SyncTV proxy")
+	}
+	if !shouldProxyEmbyMovie(proxyMovie, guest) {
+		t.Fatal("proxy-enabled movie must use the SyncTV proxy for guests")
 	}
 	if !shouldProxyEmbyMovie(directMovie, nil) {
 		t.Fatal("missing user must not receive an upstream URL")
@@ -136,11 +139,14 @@ func TestEmbyProxyDecisions(t *testing.T) {
 	if canRequestEmbyProxy(directMovie, creator) {
 		t.Fatal("creator must not use a disabled proxy endpoint")
 	}
-	if !canRequestEmbyProxy(directMovie, guest) {
-		t.Fatal("non-creator must be allowed to use the internal proxy")
+	if canRequestEmbyProxy(directMovie, guest) {
+		t.Fatal("guest must not use a disabled proxy endpoint")
 	}
 	if !canRequestEmbyProxy(proxyMovie, creator) {
 		t.Fatal("creator must be allowed when proxy is enabled")
+	}
+	if !canRequestEmbyProxy(proxyMovie, guest) {
+		t.Fatal("guest must be allowed when proxy is enabled")
 	}
 	if canRequestEmbyProxy(directMovie, nil) {
 		t.Fatal("missing user must fail closed")

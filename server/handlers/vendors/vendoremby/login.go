@@ -50,6 +50,49 @@ func (r *LoginReq) Decode(ctx *gin.Context) error {
 	return json.NewDecoder(ctx.Request.Body).Decode(r)
 }
 
+func validateEmbyLoginResponse(data *emby.LoginResp) error {
+	if data == nil || data.GetServerId() == "" || data.GetToken() == "" || data.GetUserId() == "" {
+		return errors.New("invalid emby login response")
+	}
+	return nil
+}
+
+func embyUserCacheDataFromVendor(v *dbModel.EmbyVendor) (*cache.EmbyUserCacheData, error) {
+	if v == nil || v.Host == "" || v.ServerID == "" || v.APIKey == "" || v.EmbyUserID == "" || v.UpdatedAt.IsZero() {
+		return nil, errors.New("invalid persisted emby vendor")
+	}
+	return &cache.EmbyUserCacheData{
+		Host:             v.Host,
+		ServerID:         v.ServerID,
+		APIKey:           v.APIKey,
+		Backend:          v.Backend,
+		UserID:           v.EmbyUserID,
+		BindingUpdatedAt: v.UpdatedAt,
+	}, nil
+}
+
+func cachedEmbyLogoutData(userCache *cache.EmbyUserCache, serverID string) *cache.EmbyUserCacheData {
+	if userCache == nil {
+		return nil
+	}
+	cached, ok := userCache.LoadCache(serverID)
+	if !ok {
+		return nil
+	}
+	data, err := cached.Raw()
+	if err != nil || data == nil {
+		return nil
+	}
+	copied := *data
+	return &copied
+}
+
+func deleteEmbyCachedBinding(userCache *cache.EmbyUserCache, serverID string) {
+	if userCache != nil {
+		userCache.Delete(serverID)
+	}
+}
+
 func Login(ctx *gin.Context) {
 	user := middlewares.GetUserEntry(ctx).Value()
 
@@ -68,20 +111,18 @@ func Login(ctx *gin.Context) {
 		Password: req.Password,
 	})
 	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("emby login failed"))
 		return
 	}
-
-	if data.GetServerId() == "" {
+	if err := validateEmbyLoginResponse(data); err != nil {
 		ctx.AbortWithStatusJSON(
 			http.StatusInternalServerError,
-			model.NewAPIErrorStringResp("serverID is empty"),
+			model.NewAPIErrorStringResp("invalid emby login response"),
 		)
-
 		return
 	}
 
-	_, err = db.CreateOrSaveEmbyVendor(&dbModel.EmbyVendor{
+	persisted, err := db.CreateOrSaveEmbyVendor(&dbModel.EmbyVendor{
 		UserID:     user.ID,
 		ServerID:   data.GetServerId(),
 		Host:       req.Host,
@@ -90,22 +131,26 @@ func Login(ctx *gin.Context) {
 		EmbyUserID: data.GetUserId(),
 	})
 	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("internal server error"))
 		return
 	}
 
-	_, err = user.EmbyCache().
-		StoreOrRefreshWithDynamicFunc(ctx, data.GetServerId(), func(_ context.Context, key string) (*cache.EmbyUserCacheData, error) {
-			return &cache.EmbyUserCacheData{
-				Host:     req.Host,
-				ServerID: key,
-				APIKey:   data.GetToken(),
-				Backend:  backend,
-				UserID:   data.GetUserId(),
-			}, nil
-		})
+	cacheData, err := embyUserCacheDataFromVendor(persisted)
 	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		deleteEmbyCachedBinding(user.EmbyCache(), persisted.ServerID)
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("internal server error"))
+		return
+	}
+	_, err = user.EmbyCache().StoreOrRefreshWithDynamicFunc(
+		ctx,
+		persisted.ServerID,
+		func(context.Context, string) (*cache.EmbyUserCacheData, error) {
+			return cacheData, nil
+		},
+	)
+	if err != nil {
+		deleteEmbyCachedBinding(user.EmbyCache(), persisted.ServerID)
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("internal server error"))
 		return
 	}
 
@@ -121,16 +166,14 @@ func Logout(ctx *gin.Context) {
 		return
 	}
 
-	err := db.DeleteEmbyVendor(user.ID, req.ServerID)
-	if err != nil {
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+	cached := cachedEmbyLogoutData(user.EmbyCache(), req.ServerID)
+	if err := db.DeleteEmbyVendor(user.ID, req.ServerID); err != nil {
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("internal server error"))
 		return
 	}
-
-	eucd, ok := user.EmbyCache().LoadCache(req.ServerID)
-	if ok {
-		eucdr, _ := eucd.Raw()
-		go logoutEmby(eucdr)
+	deleteEmbyCachedBinding(user.EmbyCache(), req.ServerID)
+	if cached != nil {
+		go logoutEmby(cached)
 	}
 
 	ctx.Status(http.StatusNoContent)

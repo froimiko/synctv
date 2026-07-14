@@ -129,22 +129,44 @@ func GetEmbyFirstVendor(userID string) (*model.EmbyVendor, error) {
 }
 
 func CreateOrSaveEmbyVendor(vendorInfo *model.EmbyVendor) (*model.EmbyVendor, error) {
-	if vendorInfo.UserID == "" || vendorInfo.ServerID == "" {
-		return nil, errors.New("user_id and server_id must not be empty")
+	if vendorInfo == nil {
+		return nil, errors.New("emby vendor must not be nil")
+	}
+	if vendorInfo.UserID == "" || vendorInfo.ServerID == "" || vendorInfo.Host == "" ||
+		vendorInfo.APIKey == "" || vendorInfo.EmbyUserID == "" {
+		return nil, errors.New("emby vendor identity must not be empty")
 	}
 
-	return vendorInfo, Transactional(func(tx *gorm.DB) error {
-		if errors.Is(tx.First(&model.EmbyVendor{
-			UserID:   vendorInfo.UserID,
-			ServerID: vendorInfo.ServerID,
-		}).Error, gorm.ErrRecordNotFound) {
-			return tx.Create(&vendorInfo).Error
+	var persisted model.EmbyVendor
+	err := Transactional(func(tx *gorm.DB) error {
+		var existing model.EmbyVendor
+		err := tx.Where(
+			"user_id = ? AND server_id = ?", vendorInfo.UserID, vendorInfo.ServerID,
+		).First(&existing).Error
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			if err := tx.Create(vendorInfo).Error; err != nil {
+				return err
+			}
+		case err != nil:
+			return err
+		default:
+			if err := HandleUpdateResult(
+				tx.Omit("created_at").Save(vendorInfo), ErrVendorNotFound,
+			); err != nil {
+				return err
+			}
 		}
 
-		result := tx.Omit("created_at").Save(&vendorInfo)
-
-		return HandleUpdateResult(result, ErrVendorNotFound)
+		return tx.Where(
+			"user_id = ? AND server_id = ?", vendorInfo.UserID, vendorInfo.ServerID,
+		).First(&persisted).Error
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &persisted, nil
 }
 
 func DeleteEmbyVendor(userID, serverID string) error {

@@ -14,9 +14,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/synctv-org/synctv/internal/cache"
 	"github.com/synctv-org/synctv/internal/conf"
+	"github.com/synctv-org/synctv/internal/db"
 	dbModel "github.com/synctv-org/synctv/internal/model"
 	"github.com/synctv-org/synctv/internal/op"
 	"github.com/synctv-org/synctv/internal/rtmp"
@@ -202,8 +205,23 @@ func CurrentMovie(ctx *gin.Context) {
 		ctx.GetString("token"),
 	)
 	if err != nil {
-		log.Errorf("gen current resp error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+		category := "internal_error"
+		if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
+			category = db.EmbyGrantErrorCategory(err)
+		}
+		if errors.Is(err, db.ErrEmbyGrantDenied) {
+			log.WithField("category", category).Warn("current movie emby authorization denied")
+			ctx.AbortWithStatusJSON(
+				http.StatusForbidden,
+				model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
+			)
+			return
+		}
+		log.WithField("category", category).Error("current movie generation failed")
+		ctx.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			model.NewAPIErrorStringResp("internal server error"),
+		)
 		return
 	}
 
@@ -270,8 +288,23 @@ func Movies(ctx *gin.Context) {
 				_max,
 			)
 			if err != nil {
-				log.Errorf("vendor dynamic movie list error: %v", err)
-				ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorResp(err))
+				category := "internal_error"
+				if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
+					category = db.EmbyGrantErrorCategory(err)
+				}
+				if errors.Is(err, db.ErrEmbyGrantDenied) {
+					log.WithField("category", category).Warn("dynamic emby movie authorization denied")
+					ctx.AbortWithStatusJSON(
+						http.StatusForbidden,
+						model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
+					)
+					return
+				}
+				log.WithField("category", category).Error("dynamic vendor movie list failed")
+				ctx.AbortWithStatusJSON(
+					http.StatusInternalServerError,
+					model.NewAPIErrorStringResp("internal server error"),
+				)
 				return
 			}
 
@@ -664,8 +697,67 @@ func ChangeCurrentMovie(ctx *gin.Context) {
 		return
 	}
 
+	if req.ID != "" {
+		movie, movieErr := room.GetMovieByID(req.ID)
+		if movieErr != nil {
+			ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(movieErr))
+			return
+		}
+		if movie.VendorInfo.Vendor == dbModel.VendorEmby {
+			creator, creatorErr := op.LoadOrInitUserByID(movie.CreatorID)
+			if creatorErr != nil {
+				log.WithField("category", "internal_error").Error("emby grant context load failed")
+				ctx.AbortWithStatusJSON(
+					http.StatusInternalServerError,
+					model.NewAPIErrorStringResp("internal server error"),
+				)
+				return
+			}
+			if grantErr := cache.ValidateEmbyMovieGrant(
+				ctx, movie.Movie, req.SubPath, creator.Value().EmbyCache(), time.Now().UTC(),
+			); grantErr != nil {
+				category := "internal_error"
+				if errors.Is(grantErr, db.ErrEmbyGrantDenied) || errors.Is(grantErr, db.ErrEmbyGrantInternal) {
+					category = db.EmbyGrantErrorCategory(grantErr)
+				}
+				if errors.Is(grantErr, db.ErrEmbyGrantDenied) {
+					log.WithField("category", category).Warn("emby navigation grant rejected")
+					ctx.AbortWithStatusJSON(
+						http.StatusForbidden,
+						model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
+					)
+					return
+				}
+				log.WithField("category", category).Error("emby navigation grant validation failed")
+				ctx.AbortWithStatusJSON(
+					http.StatusInternalServerError,
+					model.NewAPIErrorStringResp("internal server error"),
+				)
+				return
+			}
+		}
+	}
+
 	err = user.SetRoomCurrentMovie(room, req.ID, req.SubPath, true)
 	if err != nil {
+		if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
+			category := db.EmbyGrantErrorCategory(err)
+			if errors.Is(err, db.ErrEmbyGrantDenied) {
+				log.WithField("category", category).Warn("change current movie emby authorization denied")
+				ctx.AbortWithStatusJSON(
+					http.StatusForbidden,
+					model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
+				)
+				return
+			}
+			log.WithField("category", category).Error("change current movie emby authorization failed")
+			ctx.AbortWithStatusJSON(
+				http.StatusInternalServerError,
+				model.NewAPIErrorStringResp("internal server error"),
+			)
+			return
+		}
+
 		log.Errorf("change current movie error: %v", err)
 
 		if errors.Is(err, dbModel.ErrNoPermission) {

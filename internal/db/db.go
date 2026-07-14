@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/conf"
@@ -14,14 +15,30 @@ import (
 )
 
 var (
-	db     *gorm.DB
-	dbType conf.DatabaseType
+	db                 *gorm.DB
+	dbType             conf.DatabaseType
+	testDatabaseSwapMu sync.Mutex
 )
+
+// SwapDatabaseForTesting replaces the package database without running production initialization.
+// Tests must call the returned restore function before closing the replacement database.
+func SwapDatabaseForTesting(testDB *gorm.DB, testDBType conf.DatabaseType) func() {
+	testDatabaseSwapMu.Lock()
+	previousDB, previousDBType := db, dbType
+	db, dbType = testDB, testDBType
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			db, dbType = previousDB, previousDBType
+			testDatabaseSwapMu.Unlock()
+		})
+	}
+}
 
 func Init(d *gorm.DB, t conf.DatabaseType) error {
 	db = d
 	dbType = t
-
 	err := UpgradeDatabase()
 	if err != nil {
 		return err

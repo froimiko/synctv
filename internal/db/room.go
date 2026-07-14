@@ -154,8 +154,18 @@ func UpdateRoomSettings(roomID string, settings map[string]any) (*model.RoomSett
 }
 
 func DeleteRoomByID(roomID string) error {
-	result := db.Unscoped().Select(clause.Associations).Delete(&model.Room{ID: roomID})
-	return HandleUpdateResult(result, ErrRoomNotFound)
+	return db.Transaction(func(tx *gorm.DB) error {
+		var movieIDs []string
+		if err := tx.Unscoped().Model(&model.Movie{}).
+			Where("room_id = ?", roomID).Pluck("id", &movieIDs).Error; err != nil {
+			return err
+		}
+		if err := deleteEmbyRootGrantsByMovieIDs(tx, movieIDs); err != nil {
+			return err
+		}
+		result := tx.Unscoped().Select(clause.Associations).Delete(&model.Room{ID: roomID})
+		return HandleUpdateResult(result, ErrRoomNotFound)
+	})
 }
 
 func SetRoomPassword(roomID, password string) error {

@@ -28,6 +28,7 @@ var models = []any{
 	new(model.BilibiliVendor),
 	new(model.AlistVendor),
 	new(model.EmbyVendor),
+	new(model.EmbyRootGrant),
 	new(model.VendorBackend),
 }
 

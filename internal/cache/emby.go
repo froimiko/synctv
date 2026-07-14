@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/db"
@@ -24,78 +25,12 @@ import (
 type EmbyUserCache = MapCache0[*EmbyUserCacheData]
 
 type EmbyUserCacheData struct {
-	Host     string
-	ServerID string
-	APIKey   string
-	UserID   string
-	Backend  string
-}
-
-type embyItemGetter interface {
-	GetItem(context.Context, *emby.GetItemReq) (*emby.Item, error)
-}
-
-var errEmbyItemOutsideRoot = errors.New("emby item is not in shared root")
-
-type embyRootValidationError struct {
-	category string
-}
-
-func (e *embyRootValidationError) Error() string { return errEmbyItemOutsideRoot.Error() }
-func (e *embyRootValidationError) Unwrap() error { return errEmbyItemOutsideRoot }
-
-func newEmbyRootValidationError(category string) error {
-	return &embyRootValidationError{category: category}
-}
-
-func EmbyRootValidationCategory(err error) string {
-	var validationErr *embyRootValidationError
-	if errors.As(err, &validationErr) {
-		return validationErr.category
-	}
-	return "unknown"
-}
-
-func ValidateEmbyItemInRoot(
-	ctx context.Context,
-	cli embyItemGetter,
-	host, token, userID, rootItemID, requestedItemID string,
-) error {
-	switch {
-	case cli == nil:
-		return newEmbyRootValidationError("missing_client")
-	case userID == "":
-		return newEmbyRootValidationError("missing_user_id")
-	case rootItemID == "":
-		return newEmbyRootValidationError("missing_root_id")
-	case requestedItemID == "":
-		return newEmbyRootValidationError("missing_item_id")
-	}
-	if requestedItemID == rootItemID {
-		return nil
-	}
-
-	item, err := cli.GetItem(ctx, &emby.GetItemReq{
-		Host:       host,
-		Token:      token,
-		UserId:     userID,
-		ItemId:     requestedItemID,
-		RootItemId: rootItemID,
-	})
-	if err != nil {
-		return newEmbyRootValidationError("backend_error")
-	}
-	if item == nil {
-		return newEmbyRootValidationError("nil_response")
-	}
-	if item.GetId() != requestedItemID {
-		return newEmbyRootValidationError("proof_id_mismatch")
-	}
-	if item.GetParentId() != rootItemID {
-		return newEmbyRootValidationError("proof_root_mismatch")
-	}
-
-	return nil
+	Host             string
+	ServerID         string
+	APIKey           string
+	UserID           string
+	Backend          string
+	BindingUpdatedAt time.Time
 }
 
 func NewEmbyUserCache(userID string) *EmbyUserCache {
@@ -119,11 +54,12 @@ func EmbyAuthorizationCacheWithUserIDInitFunc(userID, serverID string) (*EmbyUse
 	}
 
 	return &EmbyUserCacheData{
-		Host:     v.Host,
-		ServerID: v.ServerID,
-		APIKey:   v.APIKey,
-		UserID:   v.EmbyUserID,
-		Backend:  v.Backend,
+		Host:             v.Host,
+		ServerID:         v.ServerID,
+		APIKey:           v.APIKey,
+		UserID:           v.EmbyUserID,
+		Backend:          v.Backend,
+		BindingUpdatedAt: v.UpdatedAt,
 	}, nil
 }
 
@@ -201,9 +137,66 @@ func NewEmbyMovieClearCacheFunc(
 	}
 }
 
+func ValidateEmbyMovieGrant(
+	ctx context.Context,
+	movie *model.Movie,
+	subPath string,
+	args *EmbyUserCache,
+	now time.Time,
+) error {
+	return validateEmbyMovieGrant(ctx, movie, subPath, args, now, ValidateEmbyNavigationGrant)
+}
+
+func validateEmbyMovieGrant(
+	ctx context.Context,
+	movie *model.Movie,
+	subPath string,
+	args *EmbyUserCache,
+	now time.Time,
+	validateGrant func(string, string, string, string, bool, time.Time) error,
+) error {
+	if err := validateEmbyArgs(args, movie, subPath); err != nil {
+		return err
+	}
+	serverID, rootItemID, requestedItemID, err := getEmbyServerIDAndPath(movie, subPath)
+	if err != nil {
+		return err
+	}
+	aucd, err := args.LoadOrStore(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if err := validateEmbyGrantBinding(aucd, serverID); err != nil {
+		return err
+	}
+	generation, err := EmbyGrantGeneration(
+		movie.ID, movie.CreatorID, aucd.Backend, serverID, rootItemID, aucd.UserID, aucd.BindingUpdatedAt,
+	)
+	if err != nil {
+		return db.NewEmbyGrantError("invalid_generation")
+	}
+	return validateGrant(movie.ID, generation, rootItemID, requestedItemID, false, now)
+}
+
 func NewEmbyMovieCacheInitFunc(
 	movie *model.Movie,
 	subPath string,
+) func(ctx context.Context, args *EmbyUserCache) (*EmbyMovieCacheData, error) {
+	return newEmbyMovieCacheInitFunc(
+		movie,
+		subPath,
+		func() time.Time { return time.Now().UTC() },
+		ValidateEmbyNavigationGrant,
+		vendor.LoadEmbyClient,
+	)
+}
+
+func newEmbyMovieCacheInitFunc(
+	movie *model.Movie,
+	subPath string,
+	now func() time.Time,
+	validateGrant func(string, string, string, string, bool, time.Time) error,
+	loadClient func(string) emby.EmbyHTTPServer,
 ) func(ctx context.Context, args *EmbyUserCache) (*EmbyMovieCacheData, error) {
 	return func(ctx context.Context, args *EmbyUserCache) (*EmbyMovieCacheData, error) {
 		if err := validateEmbyArgs(args, movie, subPath); err != nil {
@@ -219,26 +212,34 @@ func NewEmbyMovieCacheInitFunc(
 		if err != nil {
 			return nil, err
 		}
-
-		if aucd.Host == "" || aucd.APIKey == "" {
-			return nil, errors.New("not bind emby vendor")
-		}
-
-		cli := vendor.LoadEmbyClient(aucd.Backend)
-		if err := ValidateEmbyItemInRoot(
-			ctx, cli, aucd.Host, aucd.APIKey, aucd.UserID, rootItemID, requestedItemID,
-		); err != nil {
-			backendKind := "local"
-			if aucd.Backend != "" {
-				backendKind = "remote"
-			}
-			log.WithFields(log.Fields{
-				"category":     EmbyRootValidationCategory(err),
-				"backend_kind": backendKind,
-			}).Warn("emby shared-root validation rejected")
+		if err := validateEmbyGrantBinding(aucd, serverID); err != nil {
 			return nil, err
 		}
 
+		generation, err := EmbyGrantGeneration(
+			movie.ID,
+			movie.CreatorID,
+			aucd.Backend,
+			serverID,
+			rootItemID,
+			aucd.UserID,
+			aucd.BindingUpdatedAt,
+		)
+		if err != nil {
+			return nil, db.NewEmbyGrantError("invalid_generation")
+		}
+		if err := validateGrant(
+			movie.ID, generation, rootItemID, requestedItemID, false, now(),
+		); err != nil {
+			if errors.Is(err, db.ErrEmbyGrantDenied) {
+				log.WithField("category", db.EmbyGrantErrorCategory(err)).Warn("emby navigation grant rejected")
+			} else {
+				log.WithField("category", "internal_error").Error("emby navigation grant validation failed")
+			}
+			return nil, err
+		}
+
+		cli := loadClient(aucd.Backend)
 		data, err := getPlaybackInfo(ctx, cli, aucd, requestedItemID)
 		if err != nil {
 			return nil, err
@@ -273,11 +274,29 @@ func validateEmbyArgs(args *EmbyUserCache, movie *model.Movie, subPath string) e
 	if args == nil {
 		return errors.New("need emby user cache")
 	}
+	if movie == nil {
+		return errors.New("need emby movie")
+	}
+	if movie.VendorInfo.Emby == nil {
+		return errors.New("invalid emby movie configuration")
+	}
 
 	if movie.IsFolder && subPath == "" {
 		return errors.New("sub path is empty")
 	}
 
+	return nil
+}
+
+func validateEmbyGrantBinding(aucd *EmbyUserCacheData, serverID string) error {
+	switch {
+	case aucd == nil:
+		return errors.New("missing emby binding")
+	case aucd.Host == "" || aucd.APIKey == "":
+		return errors.New("not bind emby vendor")
+	case aucd.ServerID == "" || aucd.ServerID != serverID:
+		return errors.New("invalid emby binding server")
+	}
 	return nil
 }
 
@@ -301,6 +320,9 @@ func getPlaybackInfo(
 	aucd *EmbyUserCacheData,
 	truePath string,
 ) (*emby.PlaybackInfoResp, error) {
+	if cli == nil || aucd == nil {
+		return nil, errors.New("invalid playback info context")
+	}
 	data, err := cli.PlaybackInfo(ctx, &emby.PlaybackInfoReq{
 		Host:   aucd.Host,
 		Token:  aucd.APIKey,
@@ -308,7 +330,10 @@ func getPlaybackInfo(
 		ItemId: truePath,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("playback info: %w", err)
+		return nil, errors.New("playback info request failed")
+	}
+	if data == nil {
+		return nil, errors.New("playback info response is empty")
 	}
 
 	return data, nil

@@ -388,21 +388,41 @@ func UnbanUserByID(userID string) error {
 	return HandleUpdateResult(result, ErrUserNotFound)
 }
 
-func DeleteUserByID(userID string) error {
-	result := db.Unscoped().Select(clause.Associations).Delete(&model.User{ID: userID})
+func deleteUserWithEmbyGrants(tx *gorm.DB, userID string, user *model.User, columns ...clause.Column) error {
+	var roomIDs []string
+	if err := tx.Unscoped().Model(&model.Room{}).
+		Where("creator_id = ?", userID).Pluck("id", &roomIDs).Error; err != nil {
+		return err
+	}
+
+	var movieIDs []string
+	if len(roomIDs) != 0 {
+		if err := tx.Unscoped().Model(&model.Movie{}).
+			Where("room_id IN ?", roomIDs).Pluck("id", &movieIDs).Error; err != nil {
+			return err
+		}
+	}
+	if err := deleteEmbyRootGrantsByMovieIDs(tx, movieIDs); err != nil {
+		return err
+	}
+
+	result := tx.Unscoped().Clauses(clause.Returning{Columns: columns}).
+		Select(clause.Associations).Where("id = ?", userID).Delete(user)
 	return HandleUpdateResult(result, ErrUserNotFound)
+}
+
+func DeleteUserByID(userID string) error {
+	return db.Transaction(func(tx *gorm.DB) error {
+		return deleteUserWithEmbyGrants(tx, userID, &model.User{ID: userID})
+	})
 }
 
 func LoadAndDeleteUserByID(userID string, columns ...clause.Column) (*model.User, error) {
 	var user model.User
-
-	result := db.Unscoped().
-		Clauses(clause.Returning{Columns: columns}).
-		Select(clause.Associations).
-		Where("id = ?", userID).
-		Delete(&user)
-
-	return &user, HandleUpdateResult(result, ErrUserNotFound)
+	err := db.Transaction(func(tx *gorm.DB) error {
+		return deleteUserWithEmbyGrants(tx, userID, &user, columns...)
+	})
+	return &user, err
 }
 
 func SaveUser(u *model.User) error {

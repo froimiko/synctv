@@ -3,14 +3,18 @@ package vendoremby
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/cache"
+	"github.com/synctv-org/synctv/internal/db"
 	dbModel "github.com/synctv-org/synctv/internal/model"
 	"github.com/synctv-org/synctv/internal/op"
 	"github.com/synctv-org/synctv/server/model"
@@ -324,6 +328,190 @@ func TestRebuildEmbyProxyMovieRejectsMissingSources(t *testing.T) {
 	}
 	if movie.URL != "" || movie.MoreSources != nil || movie.Headers != nil || movie.Subtitles != nil {
 		t.Fatalf("stale fields remained after rejection: %#v", movie.MovieBase)
+	}
+}
+
+func TestLoadAuthorizedEmbyMovieCacheDataOrdersAuthorizationBeforeGet(t *testing.T) {
+	creatorCache := cache.NewEmbyUserCache("creator")
+	cached := &cache.EmbyMovieCacheData{
+		TranscodeSessionID: "transcode-session",
+		Sources: []cache.EmbySource{{
+			URL: "https://creator.example/video.m3u8?api_key=secret",
+			Subtitles: []*cache.EmbySubtitleCache{{
+				URL: "https://creator.example/subtitle.vtt?api_key=secret",
+			}},
+		}},
+	}
+	now := time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
+	calls := make([]string, 0, 3)
+
+	got, err := loadAuthorizedEmbyMovieCacheData(
+		context.Background(),
+		&dbModel.Movie{ID: "movie-id"},
+		"child-id",
+		"creator-id",
+		func() time.Time { return now },
+		func(_ context.Context, creatorID string) (*cache.EmbyUserCache, error) {
+			calls = append(calls, "load")
+			if creatorID != "creator-id" {
+				t.Fatalf("creator ID = %q", creatorID)
+			}
+			return creatorCache, nil
+		},
+		func(_ context.Context, movie *dbModel.Movie, subPath string, gotCache *cache.EmbyUserCache, gotNow time.Time) error {
+			calls = append(calls, "validate")
+			if movie.ID != "movie-id" || subPath != "child-id" || gotCache != creatorCache || !gotNow.Equal(now) {
+				t.Fatal("authorization inputs changed")
+			}
+			return nil
+		},
+		func(_ context.Context, gotCache *cache.EmbyUserCache) (*cache.EmbyMovieCacheData, error) {
+			calls = append(calls, "get")
+			if gotCache != creatorCache {
+				t.Fatal("cache getter received a different creator cache")
+			}
+			return cached, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("load authorized cache: %v", err)
+	}
+	if got != cached {
+		t.Fatal("authorized cache object was not returned")
+	}
+	if strings.Join(calls, ",") != "load,validate,get" {
+		t.Fatalf("call order = %q", calls)
+	}
+}
+
+func TestLoadAuthorizedEmbyMovieCacheDataRejectsExpiredGrantBeforeCachedExposure(t *testing.T) {
+	creatorCache := cache.NewEmbyUserCache("creator")
+	grantedAt := time.Date(2026, time.July, 13, 0, 0, 0, 0, time.UTC)
+	now := grantedAt.Add(dbModel.EmbyRootGrantLease + time.Second)
+	getCalled := false
+
+	got, err := loadAuthorizedEmbyMovieCacheData(
+		context.Background(),
+		&dbModel.Movie{ID: "movie-id"},
+		"child-id",
+		"creator-id",
+		func() time.Time { return now },
+		func(context.Context, string) (*cache.EmbyUserCache, error) {
+			return creatorCache, nil
+		},
+		func(_ context.Context, _ *dbModel.Movie, _ string, _ *cache.EmbyUserCache, gotNow time.Time) error {
+			if !gotNow.After(grantedAt.Add(dbModel.EmbyRootGrantLease)) {
+				t.Fatal("test did not pass a time after the grant lease")
+			}
+			return db.NewEmbyGrantError("not_found")
+		},
+		func(context.Context, *cache.EmbyUserCache) (*cache.EmbyMovieCacheData, error) {
+			getCalled = true
+			return &cache.EmbyMovieCacheData{
+				TranscodeSessionID: "must-not-leak",
+				Sources: []cache.EmbySource{{
+					URL: "https://creator.example/video.m3u8?api_key=secret",
+					Subtitles: []*cache.EmbySubtitleCache{{
+						URL: "https://creator.example/subtitle.vtt?api_key=secret",
+					}},
+				}},
+			}, nil
+		},
+	)
+	if got != nil {
+		t.Fatalf("cache data exposed after authorization expiry: %#v", got)
+	}
+	if getCalled {
+		t.Fatal("cache getter ran after authorization denial")
+	}
+	if !errors.Is(err, db.ErrEmbyGrantDenied) {
+		t.Fatalf("error = %v, want ErrEmbyGrantDenied", err)
+	}
+}
+
+func TestLoadAuthorizedEmbyMovieCacheDataStopsOnInternalError(t *testing.T) {
+	creatorCache := cache.NewEmbyUserCache("creator")
+	internalErr := errors.New("creator cache backend failed")
+	getCalled := false
+
+	got, err := loadAuthorizedEmbyMovieCacheData(
+		context.Background(),
+		&dbModel.Movie{ID: "movie-id"},
+		"child-id",
+		"creator-id",
+		time.Now,
+		func(context.Context, string) (*cache.EmbyUserCache, error) {
+			return creatorCache, nil
+		},
+		func(context.Context, *dbModel.Movie, string, *cache.EmbyUserCache, time.Time) error {
+			return internalErr
+		},
+		func(context.Context, *cache.EmbyUserCache) (*cache.EmbyMovieCacheData, error) {
+			getCalled = true
+			return &cache.EmbyMovieCacheData{}, nil
+		},
+	)
+	if got != nil {
+		t.Fatalf("cache data returned on internal error: %#v", got)
+	}
+	if getCalled {
+		t.Fatal("cache getter ran after internal authorization failure")
+	}
+	if !errors.Is(err, internalErr) {
+		t.Fatalf("error = %v, want internal error", err)
+	}
+	if errors.Is(err, db.ErrEmbyGrantDenied) {
+		t.Fatalf("internal error was misclassified as denial: %v", err)
+	}
+}
+
+func TestWriteEmbyAccessErrorDoesNotLeakSensitiveDetails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name       string
+		err        error
+		status     int
+		wantError  string
+		internal   string
+	}{
+		{
+			name:      "denied",
+			err:       db.NewEmbyGrantError("not_found"),
+			status:    http.StatusForbidden,
+			wantError: db.ErrEmbyGrantDenied.Error(),
+			internal:  "failed to load media source",
+		},
+		{
+			name:      "internal",
+			err:       errors.New("https://creator.example/video?api_key=secret"),
+			status:    http.StatusInternalServerError,
+			wantError: "failed to load media source",
+			internal:  "failed to load media source",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			writeEmbyAccessError(ctx, log.New().WithField("test", tt.name), tt.err, tt.internal)
+
+			if recorder.Code != tt.status {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.status)
+			}
+			var resp model.APIResp
+			if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if resp.Error != tt.wantError {
+				t.Fatalf("error = %q, want %q", resp.Error, tt.wantError)
+			}
+			for _, sensitive := range []string{"creator.example", "api_key", "secret"} {
+				if strings.Contains(recorder.Body.String(), sensitive) {
+					t.Fatalf("response leaked %q: %s", sensitive, recorder.Body.String())
+				}
+			}
+		})
 	}
 }
 

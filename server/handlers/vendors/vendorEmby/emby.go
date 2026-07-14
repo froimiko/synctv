@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/cache"
 	"github.com/synctv-org/synctv/internal/db"
 	dbModel "github.com/synctv-org/synctv/internal/model"
@@ -24,6 +25,13 @@ import (
 )
 
 var errInvalidSubtitleQuery = errors.New("invalid subtitle query")
+
+func embyAccessErrorCategory(err error) string {
+	if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
+		return db.EmbyGrantErrorCategory(err)
+	}
+	return "internal_error"
+}
 
 type EmbyVendorService struct {
 	room  *op.Room
@@ -46,10 +54,11 @@ func (s *EmbyVendorService) Client() emby.EmbyHTTPServer {
 }
 
 type dynamicMovieEmbyCredentials struct {
-	host    string
-	apiKey  string
-	userID  string
-	backend string
+	host             string
+	apiKey           string
+	userID           string
+	backend          string
+	bindingUpdatedAt time.Time
 }
 
 func dynamicMovieEmbyCredentialsFromCache(
@@ -63,10 +72,11 @@ func dynamicMovieEmbyCredentialsFromCache(
 	}
 
 	return &dynamicMovieEmbyCredentials{
-		host:    aucd.Host,
-		apiKey:  aucd.APIKey,
-		userID:  aucd.UserID,
-		backend: aucd.Backend,
+		host:             aucd.Host,
+		apiKey:           aucd.APIKey,
+		userID:           aucd.UserID,
+		backend:          aucd.Backend,
+		bindingUpdatedAt: aucd.BindingUpdatedAt,
 	}, nil
 }
 
@@ -80,6 +90,56 @@ func loadDynamicMovieEmbyCredentials(
 	}
 
 	return dynamicMovieEmbyCredentialsFromCache(ctx, creator.Value().EmbyCache(), serverID)
+}
+
+func (s *EmbyVendorService) grantGeneration(
+	serverID, rootItemID string,
+	credentials *dynamicMovieEmbyCredentials,
+) (string, error) {
+	if s == nil || s.movie == nil || credentials == nil {
+		return "", errors.New("invalid emby grant context")
+	}
+	return cache.EmbyGrantGeneration(
+		s.movie.ID,
+		s.movie.CreatorID,
+		credentials.backend,
+		serverID,
+		rootItemID,
+		credentials.userID,
+		credentials.bindingUpdatedAt,
+	)
+}
+
+func (s *EmbyVendorService) authorizeEmbyParent(
+	serverID, rootItemID, parentItemID string,
+	credentials *dynamicMovieEmbyCredentials,
+	now time.Time,
+) (string, error) {
+	generation, err := s.grantGeneration(serverID, rootItemID, credentials)
+	if err != nil {
+		return "", db.NewEmbyGrantError("invalid_generation")
+	}
+	if err := cache.ValidateEmbyNavigationGrant(
+		s.movie.ID, generation, rootItemID, parentItemID, true, now,
+	); err != nil {
+		return "", err
+	}
+	return generation, nil
+}
+
+func (s *EmbyVendorService) persistEmbyGrants(
+	generation, parentItemID string,
+	items []*emby.Item,
+	now time.Time,
+) error {
+	grants, err := cache.NewEmbyRootGrants(s.movie.ID, generation, parentItemID, items, now)
+	if err != nil {
+		return db.NewEmbyGrantError("malformed_response")
+	}
+	if err := db.UpsertEmbyRootGrants(grants); err != nil {
+		return db.NewEmbyGrantError("database_error")
+	}
+	return nil
 }
 
 //nolint:gosec
@@ -111,13 +171,20 @@ func (s *EmbyVendorService) ListDynamicMovie(
 		return nil, err
 	}
 
-	cli := vendor.LoadEmbyClient(credentials.backend)
-	if err := cache.ValidateEmbyItemInRoot(
-		ctx, cli, credentials.host, credentials.apiKey, credentials.userID, rootItemID, requestedItemID,
-	); err != nil {
+	now := time.Now().UTC()
+	generation, err := s.authorizeEmbyParent(
+		serverID, rootItemID, requestedItemID, credentials, now,
+	)
+	if err != nil {
+		if errors.Is(err, db.ErrEmbyGrantDenied) {
+			log.WithField("category", embyAccessErrorCategory(err)).Warn("emby navigation authorization denied")
+		} else {
+			log.WithField("category", embyAccessErrorCategory(err)).Error("emby navigation authorization failed")
+		}
 		return nil, err
 	}
 
+	cli := vendor.LoadEmbyClient(credentials.backend)
 	data, err := cli.FsList(ctx, &emby.FsListReq{
 		Host:       credentials.host,
 		Path:       requestedItemID,
@@ -128,7 +195,14 @@ func (s *EmbyVendorService) ListDynamicMovie(
 		SearchTerm: keyword,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("emby fs list error: %w", err)
+		return nil, db.NewEmbyGrantError("upstream_error")
+	}
+	if data == nil {
+		return nil, db.NewEmbyGrantError("nil_response")
+	}
+	if err := s.persistEmbyGrants(generation, requestedItemID, data.GetItems(), now); err != nil {
+		log.WithField("category", embyAccessErrorCategory(err)).Error("emby navigation grant persistence failed")
+		return nil, err
 	}
 
 	resp.Total = int64(data.GetTotal())
@@ -180,8 +254,58 @@ func embySourceCacheKey(source cache.EmbySource) (string, error) {
 	return sourceCacheKey.String(), nil
 }
 
+func loadAuthorizedEmbyMovieCacheData(
+	ctx context.Context,
+	movie *dbModel.Movie,
+	subPath, creatorID string,
+	now func() time.Time,
+	loadCreatorCache func(context.Context, string) (*cache.EmbyUserCache, error),
+	validate func(context.Context, *dbModel.Movie, string, *cache.EmbyUserCache, time.Time) error,
+	get func(context.Context, *cache.EmbyUserCache) (*cache.EmbyMovieCacheData, error),
+) (*cache.EmbyMovieCacheData, error) {
+	creatorCache, err := loadCreatorCache(ctx, creatorID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate(ctx, movie, subPath, creatorCache, now()); err != nil {
+		return nil, err
+	}
+	return get(ctx, creatorCache)
+}
+
+func (s *EmbyVendorService) embyMovieCacheData(ctx context.Context) (*cache.EmbyMovieCacheData, error) {
+	return loadAuthorizedEmbyMovieCacheData(
+		ctx,
+		s.movie.Movie,
+		s.movie.SubPath(),
+		s.movie.CreatorID,
+		func() time.Time { return time.Now().UTC() },
+		func(_ context.Context, creatorID string) (*cache.EmbyUserCache, error) {
+			creator, err := op.LoadOrInitUserByID(creatorID)
+			if err != nil {
+				return nil, err
+			}
+			return creator.Value().EmbyCache(), nil
+		},
+		cache.ValidateEmbyMovieGrant,
+		func(ctx context.Context, creatorCache *cache.EmbyUserCache) (*cache.EmbyMovieCacheData, error) {
+			return s.movie.EmbyCache().Get(ctx, creatorCache)
+		},
+	)
+}
+
+func writeEmbyAccessError(ctx *gin.Context, logger *log.Entry, err error, internalMessage string) {
+	if errors.Is(err, db.ErrEmbyGrantDenied) {
+		logger.WithField("category", embyAccessErrorCategory(err)).Warn("emby media authorization denied")
+		ctx.AbortWithStatusJSON(http.StatusForbidden, model.NewAPIErrorResp(db.ErrEmbyGrantDenied))
+		return
+	}
+	logger.WithField("category", embyAccessErrorCategory(err)).Error("emby media access failed")
+	ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp(internalMessage))
+}
+
 func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
-	log := middlewares.GetLogger(ctx)
+	logger := middlewares.GetLogger(ctx)
 
 	userEntryValue, ok := ctx.Get("user")
 	if !ok {
@@ -196,12 +320,12 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 
 	source, err := strconv.Atoi(ctx.Query("source"))
 	if err != nil {
-		log.Errorf("proxy vendor movie error: invalid source")
+		logger.Error("proxy vendor movie invalid source")
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid source"))
 		return
 	}
 	if source < 0 {
-		log.Errorf("proxy vendor movie error: %v", "source out of range")
+		logger.Error("proxy vendor movie source out of range")
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
 			model.NewAPIErrorStringResp("source out of range"),
@@ -209,28 +333,20 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		return
 	}
 
-	u, err := op.LoadOrInitUserByID(s.movie.CreatorID)
+	embyC, err := s.embyMovieCacheData(ctx)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("failed to load media source"))
-		return
-	}
-
-	embyC, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
-	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("failed to load media source"))
+		writeEmbyAccessError(ctx, logger, err, "failed to load media source")
 		return
 	}
 
 	if len(embyC.Sources) == 0 {
-		log.Errorf("proxy vendor movie error: %v", "no source")
+		logger.Error("proxy vendor movie has no source")
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("no source"))
 		return
 	}
 
 	if source >= len(embyC.Sources) {
-		log.Errorf("proxy vendor movie error: %v", "source out of range")
+		logger.Error("proxy vendor movie source out of range")
 		ctx.AbortWithStatusJSON(
 			http.StatusBadRequest,
 			model.NewAPIErrorStringResp("source out of range"),
@@ -240,8 +356,8 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 
 	sourceCacheKey, err := embySourceCacheKey(embyC.Sources[source])
 	if err != nil {
-		log.Errorf("proxy vendor movie error: invalid media source")
-		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid media source"))
+		logger.WithField("category", "internal_error").Error("proxy vendor movie source binding failed")
+		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("failed to load media source"))
 		return
 	}
 
@@ -256,7 +372,11 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		proxy.WithProxyURLCacheKey(sourceCacheKey),
 	)
 	if err != nil {
-		log.Errorf("proxy vendor movie error: %v", err)
+		logger.WithField("category", "internal_error").Error("proxy vendor movie upstream proxy failed")
+		ctx.AbortWithStatusJSON(
+			http.StatusInternalServerError,
+			model.NewAPIErrorStringResp("failed to load media source"),
+		)
 	}
 }
 
@@ -277,12 +397,7 @@ func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context) error {
 		return fmt.Errorf("%w: id out of range", errInvalidSubtitleQuery)
 	}
 
-	u, err := op.LoadOrInitUserByID(s.movie.CreatorID)
-	if err != nil {
-		return err
-	}
-
-	embyC, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
+	embyC, err := s.embyMovieCacheData(ctx)
 	if err != nil {
 		return err
 	}
@@ -317,18 +432,12 @@ func (s *EmbyVendorService) ProxyMovie(ctx *gin.Context) {
 		s.handleProxyMovie(ctx)
 	case "subtitle":
 		if err := s.handleSubtitle(ctx); err != nil {
-			log := middlewares.GetLogger(ctx)
-			log.Errorf("proxy vendor subtitle error: %v", err)
-
+			logger := middlewares.GetLogger(ctx)
 			if errors.Is(err, errInvalidSubtitleQuery) {
 				ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
 				return
 			}
-
-			ctx.AbortWithStatusJSON(
-				http.StatusInternalServerError,
-				model.NewAPIErrorStringResp("failed to load subtitle"),
-			)
+			writeEmbyAccessError(ctx, logger, err, "failed to load subtitle")
 		}
 	default:
 		ctx.AbortWithStatusJSON(
@@ -378,14 +487,7 @@ func (s *EmbyVendorService) GenMovieInfo(
 
 	movie := s.movie.Clone()
 
-	var err error
-
-	u, err := op.LoadOrInitUserByID(movie.CreatorID)
-	if err != nil {
-		return nil, err
-	}
-
-	data, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
+	data, err := s.embyMovieCacheData(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -513,14 +615,9 @@ func (s *EmbyVendorService) GenProxyMovieInfo(
 ) (*dbModel.Movie, error) {
 	movie := s.movie.Clone()
 
-	u, err := op.LoadOrInitUserByID(movie.CreatorID)
+	data, err := s.embyMovieCacheData(ctx)
 	if err != nil {
 		return nil, err
-	}
-
-	data, err := s.movie.EmbyCache().Get(ctx, u.Value().EmbyCache())
-	if err != nil {
-		return nil, errors.New("failed to load media source")
 	}
 
 	return rebuildEmbyProxyMovie(movie, data.Sources, userToken)

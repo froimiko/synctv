@@ -60,48 +60,102 @@ func TestDynamicMovieEmbyCredentialsFromCache(t *testing.T) {
 	}
 }
 
-func TestProxyMovieRejectsNegativeSubtitleIndexes(t *testing.T) {
+func TestHandleEmbySubtitleChecksGrantBeforeIndexesAndFetch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-
-	tests := []struct {
-		name  string
-		query string
-		error string
-	}{
-		{
-			name:  "negative source",
-			query: "t=subtitle&source=-1&id=0",
-			error: "invalid subtitle query: source out of range",
-		},
-		{
-			name:  "negative id",
-			query: "t=subtitle&source=0&id=-1",
-			error: "invalid subtitle query: id out of range",
-		},
+	for _, grantErr := range []error{db.NewEmbyGrantError("not_found"), errors.New("grant backend failed")} {
+		for _, rawQuery := range []string{"source=bad&id=0", "source=-1&id=-1", "source=99&id=99", "source=0&source=1&id=0"} {
+			t.Run(grantErr.Error()+"/"+rawQuery, func(t *testing.T) {
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest(http.MethodGet, "/?"+rawQuery, nil)
+				values, err := url.ParseQuery(ctx.Request.URL.RawQuery)
+				if err != nil {
+					t.Fatalf("parse test query: %v", err)
+				}
+				fetchCalled := false
+				err = handleEmbySubtitle(ctx, values,
+					func(context.Context) (*cache.EmbyMovieCacheData, error) { return nil, grantErr },
+					func(context.Context, *cache.EmbySubtitleCache) ([]byte, error) {
+						fetchCalled = true
+						return nil, nil
+					},
+				)
+				if !errors.Is(err, grantErr) || fetchCalled {
+					t.Fatalf("err = %v, fetchCalled = %v", err, fetchCalled)
+				}
+			})
+		}
 	}
+}
 
+func TestProxyMovieRejectsInvalidQuerySyntaxAndRepeatedType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	queries := []string{
+		"t=subtitle&t=subtitle&source=0&id=0",
+		"t=subtitle&source=%zz&id=0",
+		"t=subtitle&source=0&id=0;extra=x",
+		"t=subtitle&source=0&id=0&extra=%zz",
+	}
+	for _, query := range queries {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/?"+query, nil)
+		(&EmbyVendorService{}).ProxyMovie(ctx)
+		if recorder.Code != http.StatusBadRequest {
+			t.Errorf("query %q: status = %d, want 400", query, recorder.Code)
+		}
+	}
+}
+
+func TestHandleEmbySubtitleRejectsRepeatedIndexesAfterGrant(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cached := &cache.EmbyMovieCacheData{Sources: []cache.EmbySource{{Subtitles: []*cache.EmbySubtitleCache{{}}}}}
+	for _, rawQuery := range []string{"source=0&source=1&id=0", "source=0&id=0&id=1"} {
+		ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/?"+rawQuery, nil)
+		values, err := url.ParseQuery(ctx.Request.URL.RawQuery)
+		if err != nil {
+			t.Fatalf("parse query: %v", err)
+		}
+		fetchCalled := false
+		err = handleEmbySubtitle(ctx, values,
+			func(context.Context) (*cache.EmbyMovieCacheData, error) { return cached, nil },
+			func(context.Context, *cache.EmbySubtitleCache) ([]byte, error) {
+				fetchCalled = true
+				return nil, nil
+			},
+		)
+		if !errors.Is(err, errInvalidSubtitleQuery) || fetchCalled {
+			t.Errorf("query %q: err = %v, fetchCalled = %v", rawQuery, err, fetchCalled)
+		}
+	}
+}
+
+func TestServeEmbySubtitleSetsDeclaredContentType(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tests := []struct {
+		name        string
+		contentType string
+	}{
+		{name: "vtt", contentType: "text/vtt; charset=utf-8"},
+		{name: "srt", contentType: "application/x-subrip; charset=utf-8"},
+		{name: "ass", contentType: "text/x-ssa; charset=utf-8"},
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Request = httptest.NewRequest(http.MethodGet, "/?"+tt.query, nil)
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/subtitle", nil)
 
-			service := &EmbyVendorService{}
-			service.ProxyMovie(ctx)
+			serveEmbySubtitle(ctx, &cache.EmbySubtitleCache{
+				Name:        "subtitle." + tt.name,
+				ContentType: tt.contentType,
+			}, []byte("subtitle body"))
 
-			if recorder.Code != http.StatusBadRequest {
-				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			if got := recorder.Header().Get("Content-Type"); got != tt.contentType {
+				t.Fatalf("Content-Type = %q, want %q", got, tt.contentType)
 			}
-
-			var resp model.APIResp
-			if err := json.Unmarshal(recorder.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("decode response: %v", err)
-			}
-			if resp.Error != tt.error {
-				t.Fatalf("error = %q, want %q", resp.Error, tt.error)
-			}
-			if strings.Contains(recorder.Body.String(), "api_key") {
-				t.Fatalf("response leaked sensitive upstream details: %s", recorder.Body.String())
+			if recorder.Code != http.StatusOK || recorder.Body.String() != "subtitle body" {
+				t.Fatalf("response = (%d, %q)", recorder.Code, recorder.Body.String())
 			}
 		})
 	}
@@ -198,43 +252,56 @@ func TestEmbyMovieProxyURLContainsOnlyInternalAuthorization(t *testing.T) {
 	}
 }
 
-func TestEmbySubtitleProxyURLUsesPerUserToken(t *testing.T) {
+func TestEmbySubtitleProxyURLContractIsIndependentOfRoleAndMovieProxy(t *testing.T) {
 	const (
 		movieID = "movie-id"
 		roomID  = "room-id"
 	)
-
-	ownerURL, err := embySubtitleProxyURL(movieID, roomID, "owner-token", 1, 2)
-	if err != nil {
-		t.Fatalf("build owner subtitle URL: %v", err)
-	}
-	memberURL, err := embySubtitleProxyURL(movieID, roomID, "member-token", 1, 2)
-	if err != nil {
-		t.Fatalf("build member subtitle URL: %v", err)
-	}
-
-	for name, rawURL := range map[string]string{"owner": ownerURL, "member": memberURL} {
-		parsed, err := url.Parse(rawURL)
-		if err != nil {
-			t.Fatalf("parse %s URL: %v", name, err)
-		}
-		if parsed.Path != "/api/room/movie/proxy/"+movieID {
-			t.Errorf("%s path = %q", name, parsed.Path)
-		}
-		query := parsed.Query()
-		if query.Get("t") != "subtitle" || query.Get("source") != "1" || query.Get("id") != "2" || query.Get("roomId") != roomID {
-			t.Errorf("%s query = %q", name, parsed.RawQuery)
-		}
-		if strings.Contains(rawURL, "api_key") {
-			t.Errorf("%s URL leaked api_key: %q", name, rawURL)
-		}
+	tests := []struct {
+		name  string
+		proxy bool
+		token string
+	}{
+		{name: "owner direct movie", proxy: false, token: "owner-token"},
+		{name: "owner proxy movie", proxy: true, token: "owner-token"},
+		{name: "guest direct movie", proxy: false, token: "guest-token"},
+		{name: "guest proxy movie", proxy: true, token: "guest-token"},
 	}
 
-	if got := mustParseQuery(t, ownerURL).Get("token"); got != "owner-token" {
-		t.Fatalf("owner token = %q", got)
-	}
-	if got := mustParseQuery(t, memberURL).Get("token"); got != "member-token" {
-		t.Fatalf("member token = %q", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			movie := &dbModel.Movie{
+				ID:        movieID,
+				RoomID:    roomID,
+				MovieBase: dbModel.MovieBase{Proxy: tt.proxy},
+			}
+			source := cache.EmbySource{Subtitles: []*cache.EmbySubtitleCache{
+				nil,
+				nil,
+				{Name: "English", Type: "vtt", URL: "https://upstream.invalid/subtitle.vtt?api_key=secret"},
+			}}
+			if err := addEmbySourceSubtitles(movie, source, tt.token, 1); err != nil {
+				t.Fatalf("add subtitles: %v", err)
+			}
+			rawURL := movie.Subtitles["English"].URL
+			parsed, err := url.Parse(rawURL)
+			if err != nil {
+				t.Fatalf("parse subtitle URL: %v", err)
+			}
+			if parsed.Path != "/api/room/movie/proxy/"+movieID {
+				t.Errorf("path = %q", parsed.Path)
+			}
+			query := parsed.Query()
+			if query.Get("t") != "subtitle" || query.Get("source") != "1" || query.Get("id") != "2" ||
+				query.Get("roomId") != roomID || query.Get("token") != tt.token {
+				t.Errorf("query = %q", parsed.RawQuery)
+			}
+			for _, sensitive := range []string{"api_key", "upstream.invalid", "secret"} {
+				if strings.Contains(rawURL, sensitive) {
+					t.Errorf("URL leaked %q: %q", sensitive, rawURL)
+				}
+			}
+		})
 	}
 }
 
@@ -300,6 +367,83 @@ func TestRebuildEmbyProxyMovieClearsStaleFieldsAndUsesFirstValidSource(t *testin
 		if strings.Contains(string(output), sensitive) {
 			t.Fatalf("proxy output leaked %q: %q", sensitive, output)
 		}
+	}
+}
+
+func TestAddEmbySourceSubtitlesPreservesDuplicateAndEmptyNames(t *testing.T) {
+	movie := &dbModel.Movie{ID: "movie-id", RoomID: "room-id"}
+	sources := []cache.EmbySource{
+		{
+			URL: "https://upstream.invalid/primary.mp4?api_key=source-secret",
+			Subtitles: []*cache.EmbySubtitleCache{
+				{Name: "English", Type: "vtt", URL: "https://upstream.invalid/sub-0.vtt?api_key=subtitle-secret"},
+				{Name: "English", Type: "srt", URL: "https://upstream.invalid/sub-1.srt?api_key=subtitle-secret"},
+				{Name: "", Type: "ass", URL: "https://upstream.invalid/sub-2.ass?api_key=subtitle-secret"},
+				{Name: "", Type: "ass", URL: "https://upstream.invalid/sub-3.ass?api_key=subtitle-secret"},
+			},
+		},
+		{
+			URL: "https://upstream.invalid/secondary.mp4?api_key=source-secret",
+			Subtitles: []*cache.EmbySubtitleCache{
+				{Name: "English", Type: "vtt", URL: "https://upstream.invalid/sub-4.vtt?api_key=subtitle-secret"},
+			},
+		},
+	}
+
+	for sourceIndex, source := range sources {
+		if err := addEmbySourceSubtitles(movie, source, "member-token", sourceIndex); err != nil {
+			t.Fatalf("add source %d subtitles: %v", sourceIndex, err)
+		}
+	}
+
+	wantQueries := map[string][2]string{
+		"English":                              {"0", "0"},
+		"English (srt, source 1, subtitle 2)":  {"0", "1"},
+		"Subtitle":                             {"0", "2"},
+		"Subtitle (ass, source 1, subtitle 4)": {"0", "3"},
+		"English (vtt, source 2, subtitle 1)":  {"1", "0"},
+	}
+	if len(movie.Subtitles) != len(wantQueries) {
+		t.Fatalf("subtitle count = %d, want %d: %#v", len(movie.Subtitles), len(wantQueries), movie.Subtitles)
+	}
+	for name, want := range wantQueries {
+		subtitle := movie.Subtitles[name]
+		if subtitle == nil {
+			t.Errorf("missing subtitle %q", name)
+			continue
+		}
+		query := mustParseQuery(t, subtitle.URL)
+		if query.Get("source") != want[0] || query.Get("id") != want[1] || query.Get("token") != "member-token" {
+			t.Errorf("subtitle %q query = %q", name, query.Encode())
+		}
+	}
+
+	output, err := json.Marshal(movie.Subtitles)
+	if err != nil {
+		t.Fatalf("marshal subtitles: %v", err)
+	}
+	for _, sensitive := range []string{"upstream.invalid", "api_key", "source-secret", "subtitle-secret"} {
+		if strings.Contains(string(output), sensitive) {
+			t.Fatalf("subtitle output leaked %q: %s", sensitive, output)
+		}
+	}
+}
+
+func TestAddEmbySourceSubtitlesUsesStableCollisionCounter(t *testing.T) {
+	movie := &dbModel.Movie{
+		ID:     "movie-id",
+		RoomID: "room-id",
+		MovieBase: dbModel.MovieBase{Subtitles: map[string]*dbModel.Subtitle{
+			"English":                             nil,
+			"English (vtt, source 1, subtitle 1)": nil,
+		}},
+	}
+	source := cache.EmbySource{Subtitles: []*cache.EmbySubtitleCache{{Name: "English", Type: "vtt"}}}
+	if err := addEmbySourceSubtitles(movie, source, "member-token", 0); err != nil {
+		t.Fatalf("add subtitles: %v", err)
+	}
+	if movie.Subtitles["English (vtt, source 1, subtitle 1) #2"] == nil {
+		t.Fatalf("collision counter subtitle missing: %#v", movie.Subtitles)
 	}
 }
 
@@ -474,11 +618,11 @@ func TestLoadAuthorizedEmbyMovieCacheDataStopsOnInternalError(t *testing.T) {
 func TestWriteEmbyAccessErrorDoesNotLeakSensitiveDetails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tests := []struct {
-		name       string
-		err        error
-		status     int
-		wantError  string
-		internal   string
+		name      string
+		err       error
+		status    int
+		wantError string
+		internal  string
 	}{
 		{
 			name:      "denied",

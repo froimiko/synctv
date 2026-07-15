@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -71,10 +74,11 @@ type EmbySource struct {
 }
 
 type EmbySubtitleCache struct {
-	Cache *refreshcache0.RefreshCache[[]byte]
-	URL   string
-	Type  string
-	Name  string
+	Cache       *refreshcache0.RefreshCache[[]byte]
+	URL         string
+	Type        string
+	Name        string
+	ContentType string
 }
 
 type EmbyMovieCacheData struct {
@@ -365,50 +369,250 @@ func processMediaSource(
 			return nil, err
 		}
 
-		u.Path = result
+		sourceURL := *u
+		sourceURL.Path = result
+		sourceURL.RawPath = ""
 		query := url.Values{}
 		query.Set("api_key", aucd.APIKey)
 		query.Set("Static", "true")
 		query.Set("MediaSourceId", v.GetId())
-		u.RawQuery = query.Encode()
-		source.URL = u.String()
+		sourceURL.RawQuery = query.Encode()
+		source.URL = sourceURL.String()
 	}
 
 	return source, nil
+}
+
+type embySubtitleFormat struct {
+	Type        string
+	ContentType string
+}
+
+var embySubtitleFormats = map[string]embySubtitleFormat{
+	"srt": {Type: "srt", ContentType: "application/x-subrip; charset=utf-8"},
+	"vtt": {Type: "vtt", ContentType: "text/vtt; charset=utf-8"},
+	"ass": {Type: "ass", ContentType: "text/x-ssa; charset=utf-8"},
+}
+
+func normalizeEmbySubtitleCodec(codec string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(codec)) {
+	case "srt", "subrip":
+		return "srt", true
+	case "vtt", "webvtt":
+		return "vtt", true
+	case "ass", "ssa":
+		return "ass", true
+	default:
+		return "", false
+	}
+}
+
+func normalizeEmbySubtitleMIME(raw string) (string, bool) {
+	mediaType, _, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return "", false
+	}
+	switch strings.ToLower(mediaType) {
+	case "application/x-subrip", "application/srt", "text/srt", "text/x-srt":
+		return "srt", true
+	case "text/vtt", "application/vtt", "text/webvtt":
+		return "vtt", true
+	case "text/x-ssa", "text/ssa", "application/x-ssa", "application/ssa":
+		return "ass", true
+	case "text/x-ass", "text/ass", "application/x-ass", "application/ass":
+		return "ass", true
+	default:
+		return "", false
+	}
+}
+
+func normalizeEmbySubtitleExtension(rawPath string) (string, bool) {
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(rawPath)), ".")
+	if ext == "" {
+		return "", false
+	}
+	return normalizeEmbySubtitleCodec(ext)
+}
+
+func embySubtitleStreamFormat(msi *emby.MediaStreamInfo, deliveryURL *url.URL) (embySubtitleFormat, bool) {
+	if msi == nil || msi.GetType() != "Subtitle" || !msi.GetIsTextSubtitleStream() {
+		return embySubtitleFormat{}, false
+	}
+
+	var evidence []string
+	if codec := strings.TrimSpace(msi.GetCodec()); codec != "" {
+		format, ok := normalizeEmbySubtitleCodec(codec)
+		if !ok {
+			return embySubtitleFormat{}, false
+		}
+		evidence = append(evidence, format)
+	}
+	if mimeType := strings.TrimSpace(msi.GetMimeType()); mimeType != "" {
+		format, ok := normalizeEmbySubtitleMIME(mimeType)
+		if !ok {
+			return embySubtitleFormat{}, false
+		}
+		evidence = append(evidence, format)
+	}
+	if deliveryURL != nil {
+		if ext := path.Ext(deliveryURL.Path); ext != "" {
+			format, ok := normalizeEmbySubtitleExtension(deliveryURL.Path)
+			if !ok {
+				return embySubtitleFormat{}, false
+			}
+			evidence = append(evidence, format)
+		}
+	}
+	if len(evidence) == 0 {
+		return embySubtitleFormat{}, false
+	}
+	for _, candidate := range evidence[1:] {
+		if candidate != evidence[0] {
+			return embySubtitleFormat{}, false
+		}
+	}
+	format, ok := embySubtitleFormats[evidence[0]]
+	return format, ok
+}
+
+func embyEffectivePort(u *url.URL) (int, bool) {
+	if port := u.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		return value, err == nil && value > 0 && value <= 65535
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return 443, true
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return 80, true
+	}
+	return 0, false
+}
+
+func sameEmbyOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil ||
+		!strings.EqualFold(a.Scheme, b.Scheme) ||
+		!strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	aPort, aOK := embyEffectivePort(a)
+	bPort, bOK := embyEffectivePort(b)
+	return aOK && bOK && aPort == bPort
+}
+
+func validEmbySubtitleBaseURL(base *url.URL) bool {
+	if base == nil || base.User != nil || base.Fragment != "" || base.Hostname() == "" ||
+		!strings.EqualFold(base.Scheme, "http") && !strings.EqualFold(base.Scheme, "https") {
+		return false
+	}
+	_, ok := embyEffectivePort(base)
+	return ok
+}
+
+func resolveEmbySubtitleDeliveryURL(base *url.URL, raw string) (*url.URL, url.Values, bool) {
+	if !validEmbySubtitleBaseURL(base) {
+		return nil, nil, false
+	}
+
+	reference, err := url.Parse(raw)
+	if err != nil || reference.User != nil || reference.Fragment != "" {
+		return nil, nil, false
+	}
+	if reference.RawQuery != "" {
+		if _, err := url.ParseQuery(reference.RawQuery); err != nil {
+			return nil, nil, false
+		}
+	}
+	if reference.IsAbs() {
+		if !strings.EqualFold(reference.Scheme, "http") && !strings.EqualFold(reference.Scheme, "https") ||
+			reference.Hostname() == "" || !sameEmbyOrigin(base, reference) {
+			return nil, nil, false
+		}
+	} else if reference.Host != "" {
+		return nil, nil, false
+	}
+
+	resolved := base.ResolveReference(reference)
+	if resolved.User != nil || resolved.Fragment != "" || !sameEmbyOrigin(base, resolved) {
+		return nil, nil, false
+	}
+	query := url.Values{}
+	if resolved.RawQuery != "" {
+		query, err = url.ParseQuery(resolved.RawQuery)
+		if err != nil {
+			return nil, nil, false
+		}
+	}
+	resolved.Scheme = strings.ToLower(resolved.Scheme)
+	return resolved, query, true
+}
+
+func setCanonicalEmbyAPIKey(u *url.URL, query url.Values, apiKey string) {
+	for key := range query {
+		if strings.EqualFold(key, "api_key") || strings.EqualFold(key, "x-emby-token") {
+			query.Del(key)
+		}
+	}
+	query.Set("api_key", apiKey)
+	u.RawQuery = query.Encode()
+}
+
+func embySubtitleFallbackURL(base *url.URL, itemID, sourceID string, index uint64, apiKey string) (*url.URL, bool) {
+	if !validEmbySubtitleBaseURL(base) {
+		return nil, false
+	}
+
+	fallback := *base
+	reference := &url.URL{Path: path.Join(
+		"/emby", "Videos", itemID, sourceID, "Subtitles", strconv.FormatUint(index, 10), "Stream.vtt",
+	)}
+	fallback = *base.ResolveReference(reference)
+	fallback.RawPath = ""
+	fallback.RawQuery = ""
+	fallback.Fragment = ""
+	setCanonicalEmbyAPIKey(&fallback, url.Values{}, apiKey)
+	return &fallback, true
 }
 
 func processEmbySubtitles(
 	v *emby.MediaSourceInfo,
 	truePath string,
 	apiKey string,
-	u *url.URL,
+	base *url.URL,
 ) []*EmbySubtitleCache {
+	if v == nil {
+		return nil
+	}
+
 	subtitles := make([]*EmbySubtitleCache, 0, len(v.GetMediaStreamInfo()))
 	for _, msi := range v.GetMediaStreamInfo() {
-		if msi.GetType() != "Subtitle" {
-			continue
-		}
-
-		subtitleType := "srt"
-
-		result, err := url.JoinPath(
-			"emby",
-			"Videos",
-			truePath,
-			v.GetId(),
-			"Subtitles",
-			strconv.FormatUint(msi.GetIndex(), 10),
-			"Stream."+subtitleType,
+		var (
+			deliveryURL   *url.URL
+			deliveryQuery url.Values
 		)
-		if err != nil {
+		if rawDeliveryURL := strings.TrimSpace(msi.GetDeliveryUrl()); rawDeliveryURL != "" {
+			var ok bool
+			deliveryURL, deliveryQuery, ok = resolveEmbySubtitleDeliveryURL(base, rawDeliveryURL)
+			if !ok {
+				continue
+			}
+		}
+
+		format, ok := embySubtitleStreamFormat(msi, deliveryURL)
+		if !ok {
 			continue
 		}
 
-		subtitleURL := *u
-		subtitleURL.Path = result
-		query := url.Values{}
-		query.Set("api_key", apiKey)
-		subtitleURL.RawQuery = query.Encode()
+		subtitleURL := deliveryURL
+		if subtitleURL == nil {
+			subtitleURL, ok = embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey)
+			if !ok {
+				continue
+			}
+			format = embySubtitleFormats["vtt"]
+		} else {
+			setCanonicalEmbyAPIKey(subtitleURL, deliveryQuery, apiKey)
+		}
 		subtitleURLString := subtitleURL.String()
 
 		name := msi.GetDisplayTitle()
@@ -421,27 +625,41 @@ func processEmbySubtitles(
 		}
 
 		subtitles = append(subtitles, &EmbySubtitleCache{
-			URL:   subtitleURLString,
-			Type:  subtitleType,
-			Name:  name,
-			Cache: refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(subtitleURLString), -1),
+			URL:         subtitleURLString,
+			Type:        format.Type,
+			Name:        name,
+			ContentType: format.ContentType,
+			Cache:       refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(subtitleURLString), -1),
 		})
 	}
 
 	return subtitles
 }
 
-func newEmbySubtitleCacheInitFunc(url string) func(ctx context.Context) ([]byte, error) {
+const embySubtitleHTTPTimeout = 30 * time.Second
+
+func newEmbySubtitleHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: uhc.DefaultTransport,
+		Timeout:   embySubtitleHTTPTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]byte, error) {
+	client := newEmbySubtitleHTTPClient()
 	return func(ctx context.Context) ([]byte, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, errors.New("failed to create subtitle request")
 		}
 
 		req.Header.Set("User-Agent", utils.UA)
-		req.Header.Set("Referer", req.URL.Host)
+		req.Header.Set("Referer", req.URL.Scheme+"://"+req.URL.Host)
 
-		resp, err := uhc.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, errors.New("failed to fetch subtitle")
 		}
@@ -450,7 +668,17 @@ func newEmbySubtitleCacheInitFunc(url string) func(ctx context.Context) ([]byte,
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("unexpected subtitle status: %d", resp.StatusCode)
 		}
+		if resp.ContentLength > subtitleMaxLength {
+			return nil, errors.New("subtitle response too large")
+		}
 
-		return io.ReadAll(resp.Body)
+		data, err := io.ReadAll(io.LimitReader(resp.Body, subtitleMaxLength+1))
+		if err != nil {
+			return nil, errors.New("failed to read subtitle")
+		}
+		if len(data) > subtitleMaxLength {
+			return nil, errors.New("subtitle response too large")
+		}
+		return data, nil
 	}
 }

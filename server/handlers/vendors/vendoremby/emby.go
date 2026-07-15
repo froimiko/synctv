@@ -304,7 +304,15 @@ func writeEmbyAccessError(ctx *gin.Context, logger *log.Entry, err error, intern
 	ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp(internalMessage))
 }
 
-func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
+func strictQueryValue(values url.Values, key string) (string, error) {
+	items, ok := values[key]
+	if !ok || len(items) != 1 {
+		return "", fmt.Errorf("%s must appear exactly once", key)
+	}
+	return items[0], nil
+}
+
+func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context, values url.Values) {
 	logger := middlewares.GetLogger(ctx)
 
 	userEntryValue, ok := ctx.Get("user")
@@ -318,7 +326,13 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 		return
 	}
 
-	source, err := strconv.Atoi(ctx.Query("source"))
+	sourceValue, err := strictQueryValue(values, "source")
+	if err != nil {
+		logger.Error("proxy vendor movie invalid source")
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid source"))
+		return
+	}
+	source, err := strconv.Atoi(sourceValue)
 	if err != nil {
 		logger.Error("proxy vendor movie invalid source")
 		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid source"))
@@ -380,58 +394,92 @@ func (s *EmbyVendorService) handleProxyMovie(ctx *gin.Context) {
 	}
 }
 
-func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context) error {
-	source, err := strconv.Atoi(ctx.Query("source"))
+func handleEmbySubtitle(
+	ctx *gin.Context,
+	values url.Values,
+	load func(context.Context) (*cache.EmbyMovieCacheData, error),
+	fetch func(context.Context, *cache.EmbySubtitleCache) ([]byte, error),
+) error {
+	embyC, err := load(ctx)
+	if err != nil {
+		return err
+	}
+
+	sourceValue, err := strictQueryValue(values, "source")
 	if err != nil {
 		return fmt.Errorf("%w: invalid source", errInvalidSubtitleQuery)
 	}
-	if source < 0 {
+	source, err := strconv.Atoi(sourceValue)
+	if err != nil {
+		return fmt.Errorf("%w: invalid source", errInvalidSubtitleQuery)
+	}
+	if source < 0 || source >= len(embyC.Sources) {
 		return fmt.Errorf("%w: source out of range", errInvalidSubtitleQuery)
 	}
 
-	id, err := strconv.Atoi(ctx.Query("id"))
+	idValue, err := strictQueryValue(values, "id")
 	if err != nil {
 		return fmt.Errorf("%w: invalid id", errInvalidSubtitleQuery)
 	}
-	if id < 0 {
+	id, err := strconv.Atoi(idValue)
+	if err != nil {
+		return fmt.Errorf("%w: invalid id", errInvalidSubtitleQuery)
+	}
+	if id < 0 || id >= len(embyC.Sources[source].Subtitles) {
 		return fmt.Errorf("%w: id out of range", errInvalidSubtitleQuery)
 	}
 
-	embyC, err := s.embyMovieCacheData(ctx)
+	subtitle := embyC.Sources[source].Subtitles[id]
+	data, err := fetch(ctx, subtitle)
 	if err != nil {
 		return err
 	}
-
-	if source >= len(embyC.Sources) {
-		return fmt.Errorf("%w: source out of range", errInvalidSubtitleQuery)
-	}
-
-	if id >= len(embyC.Sources[source].Subtitles) {
-		return fmt.Errorf("%w: id out of range", errInvalidSubtitleQuery)
-	}
-
-	data, err := embyC.Sources[source].Subtitles[id].Cache.Get(ctx)
-	if err != nil {
-		return err
-	}
-
-	http.ServeContent(
-		ctx.Writer,
-		ctx.Request,
-		embyC.Sources[source].Subtitles[id].Name,
-		time.Now(),
-		bytes.NewReader(data),
-	)
-
+	serveEmbySubtitle(ctx, subtitle, data)
 	return nil
 }
 
+func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context, values url.Values) error {
+	return handleEmbySubtitle(
+		ctx,
+		values,
+		s.embyMovieCacheData,
+		func(ctx context.Context, subtitle *cache.EmbySubtitleCache) ([]byte, error) {
+			return subtitle.Cache.Get(ctx)
+		},
+	)
+}
+
+func serveEmbySubtitle(ctx *gin.Context, subtitle *cache.EmbySubtitleCache, data []byte) {
+	ctx.Header("Content-Type", subtitle.ContentType)
+	http.ServeContent(
+		ctx.Writer,
+		ctx.Request,
+		subtitle.Name,
+		time.Now(),
+		bytes.NewReader(data),
+	)
+}
+
 func (s *EmbyVendorService) ProxyMovie(ctx *gin.Context) {
-	switch t := ctx.Query("t"); t {
+	values, err := url.ParseQuery(ctx.Request.URL.RawQuery)
+	if err != nil {
+		ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid query"))
+		return
+	}
+
+	t := ""
+	if items, ok := values["t"]; ok {
+		if len(items) != 1 {
+			ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorStringResp("invalid proxy type"))
+			return
+		}
+		t = items[0]
+	}
+	switch t {
 	case "":
-		s.handleProxyMovie(ctx)
+		s.handleProxyMovie(ctx, values)
 	case "subtitle":
-		if err := s.handleSubtitle(ctx); err != nil {
+		if err := s.handleSubtitle(ctx, values); err != nil {
 			logger := middlewares.GetLogger(ctx)
 			if errors.Is(err, errInvalidSubtitleQuery) {
 				ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
@@ -476,6 +524,67 @@ func embySubtitleProxyURL(movieID, roomID, userToken string, source, id int) (st
 	return (&url.URL{Path: rawPath, RawQuery: rawQuery.Encode()}).String(), nil
 }
 
+func addEmbySourceSubtitles(
+	movie *dbModel.Movie,
+	source cache.EmbySource,
+	userToken string,
+	sourceIndex int,
+) error {
+	if movie == nil {
+		return errors.New("movie is required")
+	}
+	if len(source.Subtitles) == 0 {
+		return nil
+	}
+	if movie.Subtitles == nil {
+		movie.Subtitles = make(map[string]*dbModel.Subtitle, len(source.Subtitles))
+	}
+
+	for subtitleIndex, subtitle := range source.Subtitles {
+		if subtitle == nil {
+			continue
+		}
+
+		name := subtitle.Name
+		if name == "" {
+			name = "Subtitle"
+		}
+		if _, exists := movie.Subtitles[name]; exists {
+			format := subtitle.Type
+			if format == "" {
+				format = "text"
+			}
+			baseName := fmt.Sprintf(
+				"%s (%s, source %d, subtitle %d)",
+				name, format, sourceIndex+1, subtitleIndex+1,
+			)
+			name = baseName
+			for collision := 2; ; collision++ {
+				if _, exists := movie.Subtitles[name]; !exists {
+					break
+				}
+				name = fmt.Sprintf("%s #%d", baseName, collision)
+			}
+		}
+
+		subtitleURL, err := embySubtitleProxyURL(
+			movie.ID,
+			movie.RoomID,
+			userToken,
+			sourceIndex,
+			subtitleIndex,
+		)
+		if err != nil {
+			return err
+		}
+		movie.Subtitles[name] = &dbModel.Subtitle{
+			URL:  subtitleURL,
+			Type: subtitle.Type,
+		}
+	}
+	return nil
+}
+
 func (s *EmbyVendorService) GenMovieInfo(
 	ctx context.Context,
 	user *op.User,
@@ -489,6 +598,7 @@ func (s *EmbyVendorService) GenMovieInfo(
 	}
 
 	movie := s.movie.Clone()
+	movie.Subtitles = nil
 
 	data, err := s.embyMovieCacheData(ctx)
 	if err != nil {
@@ -513,26 +623,8 @@ func (s *EmbyVendorService) GenMovieInfo(
 			)
 		}
 
-		for subtitleIndex, subtitle := range source.Subtitles {
-			if movie.Subtitles == nil {
-				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(source.Subtitles))
-			}
-
-			subtitleURL, err := embySubtitleProxyURL(
-				movie.ID,
-				movie.RoomID,
-				userToken,
-				sourceIndex,
-				subtitleIndex,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			movie.Subtitles[subtitle.Name] = &dbModel.Subtitle{
-				URL:  subtitleURL,
-				Type: subtitle.Type,
-			}
+		if err := addEmbySourceSubtitles(movie, source, userToken, sourceIndex); err != nil {
+			return nil, err
 		}
 	}
 
@@ -581,26 +673,8 @@ func rebuildEmbyProxyMovie(
 			})
 		}
 
-		for subtitleIndex, subtitle := range source.Subtitles {
-			if movie.Subtitles == nil {
-				movie.Subtitles = make(map[string]*dbModel.Subtitle, len(source.Subtitles))
-			}
-
-			subtitleURL, err := embySubtitleProxyURL(
-				movie.ID,
-				movie.RoomID,
-				userToken,
-				sourceIndex,
-				subtitleIndex,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			movie.Subtitles[subtitle.Name] = &dbModel.Subtitle{
-				URL:  subtitleURL,
-				Type: subtitle.Type,
-			}
+		if err := addEmbySourceSubtitles(movie, source, userToken, sourceIndex); err != nil {
+			return nil, err
 		}
 	}
 

@@ -439,14 +439,14 @@ func embySubtitleStreamFormat(msi *emby.MediaStreamInfo, deliveryURL *url.URL) (
 		return embySubtitleFormat{}, false
 	}
 
-	var evidence []string
+	// The source codec only establishes that the source is a supported text subtitle.
 	if codec := strings.TrimSpace(msi.GetCodec()); codec != "" {
-		format, ok := normalizeEmbySubtitleCodec(codec)
-		if !ok {
+		if _, ok := normalizeEmbySubtitleCodec(codec); !ok {
 			return embySubtitleFormat{}, false
 		}
-		evidence = append(evidence, format)
 	}
+
+	var evidence []string
 	if mimeType := strings.TrimSpace(msi.GetMimeType()); mimeType != "" {
 		format, ok := normalizeEmbySubtitleMIME(mimeType)
 		if !ok {
@@ -454,7 +454,10 @@ func embySubtitleStreamFormat(msi *emby.MediaStreamInfo, deliveryURL *url.URL) (
 		}
 		evidence = append(evidence, format)
 	}
+
 	if deliveryURL != nil {
+		// Delivery evidence determines the returned format; source codec is not
+		// compared with the negotiated delivery format.
 		if ext := path.Ext(deliveryURL.Path); ext != "" {
 			format, ok := normalizeEmbySubtitleExtension(deliveryURL.Path)
 			if !ok {
@@ -462,10 +465,19 @@ func embySubtitleStreamFormat(msi *emby.MediaStreamInfo, deliveryURL *url.URL) (
 			}
 			evidence = append(evidence, format)
 		}
+		if len(evidence) == 0 {
+			return embySubtitleFormat{}, false
+		}
+	} else {
+		if codec := strings.TrimSpace(msi.GetCodec()); codec != "" {
+			format, _ := normalizeEmbySubtitleCodec(codec)
+			evidence = append(evidence, format)
+		}
+		if len(evidence) == 0 {
+			return embySubtitleFormat{}, false
+		}
 	}
-	if len(evidence) == 0 {
-		return embySubtitleFormat{}, false
-	}
+
 	for _, candidate := range evidence[1:] {
 		if candidate != evidence[0] {
 			return embySubtitleFormat{}, false

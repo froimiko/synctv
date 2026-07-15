@@ -117,6 +117,49 @@ func TestProcessEmbySubtitlesNormalizesSupportedTextFormats(t *testing.T) {
 	}
 }
 
+func TestProcessEmbySubtitlesUsesNegotiatedDeliveryFormat(t *testing.T) {
+	tests := []struct {
+		name        string
+		codec       string
+		mimeType    string
+		deliveryURL string
+	}{
+		{name: "source subrip delivered as vtt", codec: "subrip", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "source srt delivered as vtt", codec: "srt", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "source ass delivered as vtt", codec: "ass", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "source ssa delivered as vtt", codec: "ssa", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "source ass with consistent vtt delivery evidence", codec: "ass", mimeType: "text/vtt", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "source vtt delivered as vtt", codec: "webvtt", deliveryURL: "/subtitles/stream.vtt"},
+		{name: "mime proves extensionless vtt delivery", codec: "subrip", mimeType: "text/vtt", deliveryURL: "/subtitles/stream"},
+		{name: "source subrip without delivery URL falls back to vtt", codec: "subrip"},
+		{name: "vtt mime without delivery URL falls back to vtt", mimeType: "text/vtt"},
+		{name: "ass mime without delivery URL falls back to vtt", mimeType: "text/x-ass"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stream := textSubtitle(tt.codec, tt.mimeType, tt.deliveryURL)
+			stream.Index = 3
+			got := processEmbySubtitles(
+				&emby.MediaSourceInfo{Id: "synthetic-source", MediaStreamInfo: []*emby.MediaStreamInfo{stream}},
+				"synthetic-item", testEmbyAPIKey, mustTestURL(t, "https://emby.example/root/"),
+			)
+			if len(got) != 1 {
+				t.Fatalf("subtitle count = %d, want 1", len(got))
+			}
+			if got[0].Type != "vtt" || got[0].ContentType != "text/vtt; charset=utf-8" {
+				t.Fatalf("format = (%q, %q), want (%q, %q)", got[0].Type, got[0].ContentType, "vtt", "text/vtt; charset=utf-8")
+			}
+		})
+	}
+}
+
+func TestProcessEmbySubtitlesNilSourceIsSafe(t *testing.T) {
+	if got := processEmbySubtitles(nil, "item", testEmbyAPIKey, mustTestURL(t, "https://emby.example/root/")); got != nil {
+		t.Fatalf("subtitles = %#v, want nil", got)
+	}
+}
+
 func TestProcessEmbySubtitlesOmitsUnsafeOrUnsupportedStreams(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -127,13 +170,12 @@ func TestProcessEmbySubtitlesOmitsUnsafeOrUnsupportedStreams(t *testing.T) {
 		{name: "subtitle type is case sensitive", stream: &emby.MediaStreamInfo{Type: "subtitle", IsTextSubtitleStream: true, Codec: "srt", DeliveryUrl: "/subs/a.srt"}},
 		{name: "not text", stream: &emby.MediaStreamInfo{Type: "Subtitle", Codec: "srt"}},
 		{name: "bitmap", stream: textSubtitle("pgs", "", "/subs/a.sup")},
-		{name: "unknown codec", stream: textSubtitle("unknown", "", "/subs/a.srt")},
+		{name: "unknown codec with known vtt delivery", stream: textSubtitle("unknown", "", "/subs/a.vtt")},
 		{name: "unknown mime", stream: textSubtitle("srt", "application/octet-stream", "/subs/a.srt")},
 		{name: "unknown extension", stream: textSubtitle("srt", "", "/subs/a.bin")},
 		{name: "delivery path has no extension", stream: textSubtitle("", "", "/subs/no-extension")},
 		{name: "no format evidence", stream: textSubtitle("", "", "")},
-		{name: "codec mime conflict", stream: textSubtitle("srt", "text/vtt", "/subs/a.srt")},
-		{name: "codec extension conflict", stream: textSubtitle("ass", "", "/subs/a.vtt")},
+		{name: "delivery mime extension conflict with known source", stream: textSubtitle("srt", "text/vtt", "/subs/a.srt")},
 		{name: "mime extension conflict", stream: textSubtitle("", "text/vtt", "/subs/a.srt")},
 	}
 

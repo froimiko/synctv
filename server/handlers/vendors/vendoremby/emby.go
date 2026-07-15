@@ -30,7 +30,42 @@ func embyAccessErrorCategory(err error) string {
 	if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
 		return db.EmbyGrantErrorCategory(err)
 	}
+	if category := cache.EmbyDiagnosticErrorCategory(err); category != "" {
+		return category
+	}
 	return "internal_error"
+}
+
+func embyDiagnosticBaseLogEntry(logger *log.Entry) *log.Entry {
+	if logger == nil || logger.Logger == nil {
+		return log.NewEntry(log.StandardLogger())
+	}
+	return log.NewEntry(logger.Logger)
+}
+
+func embyDiagnosticLogEntry(logger *log.Entry, err error) *log.Entry {
+	details, ok := cache.EmbyDiagnosticDetailsFromError(err)
+	if !ok {
+		return embyDiagnosticBaseLogEntry(logger).WithField("category", embyAccessErrorCategory(err))
+	}
+
+	fields := log.Fields{"category": details.Category}
+	if details.HTTPStatus != 0 {
+		fields["http_status"] = details.HTTPStatus
+	}
+	if details.Timeout {
+		fields["timeout"] = true
+	}
+	if details.SourceCount >= 0 {
+		fields["source_count"] = details.SourceCount
+	}
+	if details.MediaStreamCount >= 0 {
+		fields["media_stream_count"] = details.MediaStreamCount
+	}
+	if details.SubtitleCount >= 0 {
+		fields["subtitle_count"] = details.SubtitleCount
+	}
+	return embyDiagnosticBaseLogEntry(logger).WithFields(fields)
 }
 
 type EmbyVendorService struct {
@@ -270,6 +305,11 @@ func loadAuthorizedEmbyMovieCacheData(
 	if err := validate(ctx, movie, subPath, creatorCache, now()); err != nil {
 		return nil, err
 	}
+	if ginCtx, ok := ctx.(*gin.Context); ok {
+		embyDiagnosticBaseLogEntry(middlewares.GetLogger(ginCtx)).
+			WithField("category", "handler_cache_fetch").
+			Info("emby media authorization passed; fetching movie cache")
+	}
 	return get(ctx, creatorCache)
 }
 
@@ -300,7 +340,7 @@ func writeEmbyAccessError(ctx *gin.Context, logger *log.Entry, err error, intern
 		ctx.AbortWithStatusJSON(http.StatusForbidden, model.NewAPIErrorResp(db.ErrEmbyGrantDenied))
 		return
 	}
-	logger.WithField("category", embyAccessErrorCategory(err)).Error("emby media access failed")
+	embyDiagnosticLogEntry(logger, err).Error("emby media access failed")
 	ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp(internalMessage))
 }
 
@@ -404,6 +444,15 @@ func handleEmbySubtitle(
 	if err != nil {
 		return err
 	}
+	if embyC == nil {
+		return cache.NewEmbyDiagnosticErrorWithCounts(
+			"media_source_processing_failed",
+			nil,
+			0,
+			-1,
+			-1,
+		)
+	}
 
 	sourceValue, err := strictQueryValue(values, "source")
 	if err != nil {
@@ -430,14 +479,32 @@ func handleEmbySubtitle(
 	}
 
 	subtitle := embyC.Sources[source].Subtitles[id]
+	if subtitle == nil || subtitle.Cache == nil {
+		return cache.NewEmbyDiagnosticErrorWithCounts(
+			"subtitle_cache_fetch_failed",
+			nil,
+			len(embyC.Sources),
+			-1,
+			len(embyC.Sources[source].Subtitles),
+		)
+	}
 	data, err := fetch(ctx, subtitle)
 	if err != nil {
+		if cache.EmbyDiagnosticErrorCategory(err) == "" {
+			err = cache.NewEmbyDiagnosticErrorWithCounts(
+				"subtitle_cache_fetch_failed",
+				err,
+				len(embyC.Sources),
+				-1,
+				len(embyC.Sources[source].Subtitles),
+			)
+		}
 		return err
 	}
+
 	serveEmbySubtitle(ctx, subtitle, data)
 	return nil
 }
-
 func (s *EmbyVendorService) handleSubtitle(ctx *gin.Context, values url.Values) error {
 	return handleEmbySubtitle(
 		ctx,
@@ -480,12 +547,11 @@ func (s *EmbyVendorService) ProxyMovie(ctx *gin.Context) {
 		s.handleProxyMovie(ctx, values)
 	case "subtitle":
 		if err := s.handleSubtitle(ctx, values); err != nil {
-			logger := middlewares.GetLogger(ctx)
 			if errors.Is(err, errInvalidSubtitleQuery) {
 				ctx.AbortWithStatusJSON(http.StatusBadRequest, model.NewAPIErrorResp(err))
 				return
 			}
-			writeEmbyAccessError(ctx, logger, err, "failed to load subtitle")
+			writeEmbyAccessError(ctx, middlewares.GetLogger(ctx), err, "failed to load subtitle")
 		}
 	default:
 		ctx.AbortWithStatusJSON(

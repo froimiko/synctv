@@ -85,6 +85,86 @@ type EmbyMovieCacheData struct {
 	Sources            []EmbySource
 }
 
+type EmbyDiagnosticDetails struct {
+	Category         string
+	HTTPStatus       int
+	Timeout          bool
+	SourceCount      int
+	MediaStreamCount int
+	SubtitleCount    int
+}
+
+type embyDiagnosticError struct {
+	details EmbyDiagnosticDetails
+	message string
+	cause   error
+}
+
+func (e *embyDiagnosticError) Error() string { return e.message }
+func (e *embyDiagnosticError) Unwrap() error { return e.cause }
+
+func newEmbyDiagnosticError(category, message string, cause error) error {
+	return &embyDiagnosticError{
+		details: EmbyDiagnosticDetails{
+			Category:         category,
+			SourceCount:      -1,
+			MediaStreamCount: -1,
+			SubtitleCount:    -1,
+		},
+		message: message,
+		cause:   cause,
+	}
+}
+
+func newEmbyDiagnosticErrorWithDetails(
+	category, message string,
+	cause error,
+	configure func(*EmbyDiagnosticDetails),
+) error {
+	err := newEmbyDiagnosticError(category, message, cause).(*embyDiagnosticError)
+	if configure != nil {
+		configure(&err.details)
+	}
+	return err
+}
+
+func NewEmbyDiagnosticError(category string, cause error) error {
+	return newEmbyDiagnosticError(category, "emby media request failed", cause)
+}
+
+func NewEmbyDiagnosticErrorWithCounts(
+	category string,
+	cause error,
+	sourceCount, mediaStreamCount, subtitleCount int,
+) error {
+	return newEmbyDiagnosticErrorWithDetails(
+		category,
+		"emby media request failed",
+		cause,
+		func(details *EmbyDiagnosticDetails) {
+			details.SourceCount = sourceCount
+			details.MediaStreamCount = mediaStreamCount
+			details.SubtitleCount = subtitleCount
+		},
+	)
+}
+
+func EmbyDiagnosticDetailsFromError(err error) (EmbyDiagnosticDetails, bool) {
+	var diagnosticErr *embyDiagnosticError
+	if !errors.As(err, &diagnosticErr) {
+		return EmbyDiagnosticDetails{}, false
+	}
+	return diagnosticErr.details, true
+}
+
+func EmbyDiagnosticErrorCategory(err error) string {
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok {
+		return ""
+	}
+	return details.Category
+}
+
 type EmbyMovieCache = refreshcache1.RefreshCache[*EmbyMovieCacheData, *EmbyUserCache]
 
 func NewEmbyMovieCache(movie *model.Movie, subPath string) *EmbyMovieCache {
@@ -248,29 +328,92 @@ func newEmbyMovieCacheInitFunc(
 			return nil, err
 		}
 
-		resp := &EmbyMovieCacheData{
-			Sources:            make([]EmbySource, len(data.GetMediaSourceInfo())),
-			TranscodeSessionID: data.GetPlaySessionID(),
-		}
-
-		u, err := url.Parse(aucd.Host)
-		if err != nil {
-			return nil, err
-		}
-
-		for i, v := range data.GetMediaSourceInfo() {
-			source, err := processMediaSource(v, movie, aucd, requestedItemID, u)
-			if err != nil {
-				return nil, err
-			}
-
-			if source != nil {
-				resp.Sources[i] = *source
-				resp.Sources[i].Subtitles = processEmbySubtitles(v, requestedItemID, aucd.APIKey, u)
-			}
-		}
-		return resp, nil
+		return processPlaybackInfoResponse(data, movie, aucd, requestedItemID)
 	}
+}
+
+func newEmbyMediaSourceProcessingError(
+	message string,
+	cause error,
+	mediaSources []*emby.MediaSourceInfo,
+) error {
+	mediaStreamCount := 0
+	subtitleCount := 0
+	for _, source := range mediaSources {
+		if source == nil {
+			continue
+		}
+		mediaStreamCount += len(source.GetMediaStreamInfo())
+		for _, stream := range source.GetMediaStreamInfo() {
+			if stream != nil && stream.GetType() == "Subtitle" {
+				subtitleCount++
+			}
+		}
+	}
+
+	return newEmbyDiagnosticErrorWithDetails(
+		"media_source_processing_failed",
+		message,
+		cause,
+		func(details *EmbyDiagnosticDetails) {
+			details.SourceCount = len(mediaSources)
+			details.MediaStreamCount = mediaStreamCount
+			details.SubtitleCount = subtitleCount
+		},
+	)
+}
+
+func processPlaybackInfoResponse(
+	data *emby.PlaybackInfoResp,
+	movie *model.Movie,
+	aucd *EmbyUserCacheData,
+	requestedItemID string,
+) (*EmbyMovieCacheData, error) {
+	if data == nil {
+		return nil, newEmbyDiagnosticError("playback_info_empty", "playback info response is empty", nil)
+	}
+
+	mediaSources := data.GetMediaSourceInfo()
+	if len(mediaSources) == 0 {
+		return nil, newEmbyDiagnosticErrorWithDetails(
+			"playback_info_empty",
+			"playback info response is empty",
+			nil,
+			func(details *EmbyDiagnosticDetails) {
+				details.SourceCount = 0
+			},
+		)
+	}
+
+	resp := &EmbyMovieCacheData{
+		Sources:            make([]EmbySource, len(mediaSources)),
+		TranscodeSessionID: data.GetPlaySessionID(),
+	}
+
+	u, err := url.Parse(aucd.Host)
+	if err != nil {
+		return nil, newEmbyMediaSourceProcessingError("failed to process media sources", err, mediaSources)
+	}
+
+	validSourceCount := 0
+	for i, v := range mediaSources {
+		source, err := processMediaSource(v, movie, aucd, requestedItemID, u)
+		if err != nil {
+			return nil, newEmbyMediaSourceProcessingError("failed to process media source", err, mediaSources)
+		}
+		if source == nil {
+			continue
+		}
+
+		validSourceCount++
+		resp.Sources[i] = *source
+		resp.Sources[i].Subtitles = processEmbySubtitles(v, requestedItemID, aucd.APIKey, u)
+	}
+	if validSourceCount == 0 {
+		return nil, newEmbyMediaSourceProcessingError("failed to process media sources", nil, mediaSources)
+	}
+
+	return resp, nil
 }
 
 func validateEmbyArgs(args *EmbyUserCache, movie *model.Movie, subPath string) error {
@@ -324,7 +467,11 @@ func getPlaybackInfo(
 	truePath string,
 ) (*emby.PlaybackInfoResp, error) {
 	if cli == nil || aucd == nil {
-		return nil, errors.New("invalid playback info context")
+		return nil, newEmbyDiagnosticError(
+			"playback_info_failed",
+			"playback info request failed",
+			errors.New("invalid playback info context"),
+		)
 	}
 	data, err := cli.PlaybackInfo(ctx, &emby.PlaybackInfoReq{
 		Host:   aucd.Host,
@@ -333,12 +480,8 @@ func getPlaybackInfo(
 		ItemId: truePath,
 	})
 	if err != nil {
-		return nil, errors.New("playback info request failed")
+		return nil, newEmbyDiagnosticError("playback_info_failed", "playback info request failed", err)
 	}
-	if data == nil {
-		return nil, errors.New("playback info response is empty")
-	}
-
 	return data, nil
 }
 
@@ -492,7 +635,11 @@ func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]by
 	return func(ctx context.Context) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
-			return nil, errors.New("failed to create subtitle request")
+			return nil, newEmbyDiagnosticError(
+				"subtitle_upstream_request_failed",
+				"failed to create subtitle request",
+				err,
+			)
 		}
 
 		req.Header.Set("User-Agent", utils.UA)
@@ -500,23 +647,56 @@ func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]by
 
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, errors.New("failed to fetch subtitle")
+			timeout := false
+			category := "subtitle_upstream_request_failed"
+			var netErr interface{ Timeout() bool }
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				timeout = true
+				category = "subtitle_upstream_timeout"
+			}
+			return nil, newEmbyDiagnosticErrorWithDetails(
+				category,
+				"failed to fetch subtitle",
+				err,
+				func(details *EmbyDiagnosticDetails) {
+					details.Timeout = timeout
+				},
+			)
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("unexpected subtitle status: %d", resp.StatusCode)
+			return nil, newEmbyDiagnosticErrorWithDetails(
+				"subtitle_upstream_status",
+				fmt.Sprintf("unexpected subtitle status: %d", resp.StatusCode),
+				nil,
+				func(details *EmbyDiagnosticDetails) {
+					details.HTTPStatus = resp.StatusCode
+				},
+			)
 		}
 		if resp.ContentLength > subtitleMaxLength {
-			return nil, errors.New("subtitle response too large")
+			return nil, newEmbyDiagnosticError(
+				"subtitle_response_too_large",
+				"subtitle response too large",
+				nil,
+			)
 		}
 
 		data, err := io.ReadAll(io.LimitReader(resp.Body, subtitleMaxLength+1))
 		if err != nil {
-			return nil, errors.New("failed to read subtitle")
+			return nil, newEmbyDiagnosticError(
+				"subtitle_upstream_read_failed",
+				"failed to read subtitle",
+				err,
+			)
 		}
 		if len(data) > subtitleMaxLength {
-			return nil, errors.New("subtitle response too large")
+			return nil, newEmbyDiagnosticError(
+				"subtitle_response_too_large",
+				"subtitle response too large",
+				nil,
+			)
 		}
 		return data, nil
 	}

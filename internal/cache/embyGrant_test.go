@@ -253,7 +253,13 @@ func (c *playbackInfoEmbyClient) PlaybackInfo(
 ) (*emby.PlaybackInfoResp, error) {
 	c.calls++
 	c.req = req
-	return &emby.PlaybackInfoResp{PlaySessionID: "session"}, nil
+	return &emby.PlaybackInfoResp{
+		PlaySessionID: "session",
+		MediaSourceInfo: []*emby.MediaSourceInfo{{
+			Id:        "source",
+			Container: "mp4",
+		}},
+	}, nil
 }
 
 func newEmbyMovieCacheInitForTest(

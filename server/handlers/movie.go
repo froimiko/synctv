@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	log "github.com/sirupsen/logrus"
 	"github.com/synctv-org/synctv/internal/cache"
 	"github.com/synctv-org/synctv/internal/conf"
 	"github.com/synctv-org/synctv/internal/db"
@@ -192,10 +193,61 @@ func genCurrentRespWithCurrent(
 	return resp, nil
 }
 
+func currentMovieErrorLogEntry(logger *log.Entry, err error) *log.Entry {
+	base := log.NewEntry(log.StandardLogger())
+	if logger != nil && logger.Logger != nil {
+		base = log.NewEntry(logger.Logger)
+	}
+
+	if details, ok := cache.EmbyDiagnosticDetailsFromError(err); ok {
+		fields := log.Fields{"category": details.Category}
+		if details.HTTPStatus != 0 {
+			fields["http_status"] = details.HTTPStatus
+		}
+		if details.Timeout {
+			fields["timeout"] = true
+		}
+		if details.SourceCount >= 0 {
+			fields["source_count"] = details.SourceCount
+		}
+		if details.MediaStreamCount >= 0 {
+			fields["media_stream_count"] = details.MediaStreamCount
+		}
+		if details.SubtitleCount >= 0 {
+			fields["subtitle_count"] = details.SubtitleCount
+		}
+		return base.WithFields(fields)
+	}
+
+	category := "internal_error"
+	if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
+		category = db.EmbyGrantErrorCategory(err)
+	}
+	return base.WithField("category", category)
+}
+
+func writeCurrentMovieError(ctx *gin.Context, logger *log.Entry, err error) {
+	entry := currentMovieErrorLogEntry(logger, err)
+	if errors.Is(err, db.ErrEmbyGrantDenied) {
+		entry.Warn("current movie emby authorization denied")
+		ctx.AbortWithStatusJSON(
+			http.StatusForbidden,
+			model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
+		)
+		return
+	}
+
+	entry.Error("current movie generation failed")
+	ctx.AbortWithStatusJSON(
+		http.StatusInternalServerError,
+		model.NewAPIErrorStringResp("internal server error"),
+	)
+}
+
 func CurrentMovie(ctx *gin.Context) {
 	room := middlewares.GetRoomEntry(ctx).Value()
 	user := middlewares.GetUserEntry(ctx).Value()
-	log := middlewares.GetLogger(ctx)
+	logger := middlewares.GetLogger(ctx)
 
 	currentResp, err := genCurrentRespWithCurrent(
 		ctx,
@@ -205,23 +257,7 @@ func CurrentMovie(ctx *gin.Context) {
 		ctx.GetString("token"),
 	)
 	if err != nil {
-		category := "internal_error"
-		if errors.Is(err, db.ErrEmbyGrantDenied) || errors.Is(err, db.ErrEmbyGrantInternal) {
-			category = db.EmbyGrantErrorCategory(err)
-		}
-		if errors.Is(err, db.ErrEmbyGrantDenied) {
-			log.WithField("category", category).Warn("current movie emby authorization denied")
-			ctx.AbortWithStatusJSON(
-				http.StatusForbidden,
-				model.NewAPIErrorResp(db.ErrEmbyGrantDenied),
-			)
-			return
-		}
-		log.WithField("category", category).Error("current movie generation failed")
-		ctx.AbortWithStatusJSON(
-			http.StatusInternalServerError,
-			model.NewAPIErrorStringResp("internal server error"),
-		)
+		writeCurrentMovieError(ctx, logger, err)
 		return
 	}
 

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -74,6 +75,135 @@ func TestProcessMediaSourceDoesNotMutateBase(t *testing.T) {
 	if base.String() != original {
 		t.Fatalf("base URL mutated: got %q, want %q", base, original)
 	}
+}
+
+func TestGetPlaybackInfoClassifiesUpstreamFailure(t *testing.T) {
+	cause := errors.New("https://private.example/playback?api_key=secret")
+	client := &playbackInfoResultClient{err: cause}
+
+	data, err := getPlaybackInfo(context.Background(), client, &EmbyUserCacheData{
+		Host:   "https://emby.example",
+		APIKey: "secret",
+		UserID: "emby-user",
+	}, "item")
+	if data != nil || !errors.Is(err, cause) {
+		t.Fatalf("playback info = (%#v, %v)", data, err)
+	}
+	if category := EmbyDiagnosticErrorCategory(err); category != "playback_info_failed" {
+		t.Fatalf("category = %q, want playback_info_failed", category)
+	}
+	assertRedactedSubtitleError(t, err, []string{"private.example", "api_key", "secret"})
+}
+
+func TestProcessPlaybackInfoResponseClassifiesEmptyAndInvalidSources(t *testing.T) {
+	binding := &EmbyUserCacheData{Host: "https://emby.example", APIKey: testEmbyAPIKey}
+	tests := []struct {
+		name         string
+		response     *emby.PlaybackInfoResp
+		wantCategory string
+		wantSources  int
+		wantStreams  int
+		wantSubs     int
+	}{
+		{
+			name:         "nil response",
+			response:     nil,
+			wantCategory: "playback_info_empty",
+			wantSources:  -1,
+			wantStreams:  -1,
+			wantSubs:     -1,
+		},
+		{
+			name:         "empty media sources",
+			response:     &emby.PlaybackInfoResp{},
+			wantCategory: "playback_info_empty",
+			wantSources:  0,
+			wantStreams:  -1,
+			wantSubs:     -1,
+		},
+		{
+			name: "all nil or unplayable sources",
+			response: &emby.PlaybackInfoResp{MediaSourceInfo: []*emby.MediaSourceInfo{
+				nil,
+				{
+					MediaStreamInfo: []*emby.MediaStreamInfo{
+						{Type: "Audio"},
+						{Type: "Subtitle"},
+					},
+				},
+			}},
+			wantCategory: "media_source_processing_failed",
+			wantSources:  2,
+			wantStreams:  2,
+			wantSubs:     1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := processPlaybackInfoResponse(tt.response, nil, binding, "item")
+			if data != nil || err == nil {
+				t.Fatalf("processed response = (%#v, %v), want error", data, err)
+			}
+			details, ok := EmbyDiagnosticDetailsFromError(err)
+			if !ok {
+				t.Fatalf("missing diagnostic details: %v", err)
+			}
+			if details.Category != tt.wantCategory || details.SourceCount != tt.wantSources ||
+				details.MediaStreamCount != tt.wantStreams || details.SubtitleCount != tt.wantSubs {
+				t.Fatalf("details = %#v", details)
+			}
+		})
+	}
+}
+
+func TestProcessPlaybackInfoResponseKeepsStableIndexesWhenAnySourceIsValid(t *testing.T) {
+	binding := &EmbyUserCacheData{Host: "https://emby.example", APIKey: testEmbyAPIKey}
+	response := &emby.PlaybackInfoResp{
+		PlaySessionID: "session",
+		MediaSourceInfo: []*emby.MediaSourceInfo{
+			nil,
+			{},
+			{Id: "source", Container: "mp4"},
+		},
+	}
+
+	data, err := processPlaybackInfoResponse(response, nil, binding, "item")
+	if err != nil {
+		t.Fatalf("process playback info: %v", err)
+	}
+	if data == nil || data.TranscodeSessionID != "session" || len(data.Sources) != 3 {
+		t.Fatalf("cache data = %#v", data)
+	}
+	if data.Sources[0].URL != "" || data.Sources[1].URL != "" || data.Sources[2].URL == "" {
+		t.Fatalf("stable source indexes were not preserved: %#v", data.Sources)
+	}
+}
+
+func TestProcessMediaSourceTreatsDirectURLAsValidWithoutContainer(t *testing.T) {
+	source, err := processMediaSource(
+		&emby.MediaSourceInfo{Id: "source", DirectPlayUrl: "/Videos/item/stream"},
+		nil,
+		&EmbyUserCacheData{Host: "https://emby.example", APIKey: testEmbyAPIKey},
+		"item",
+		mustTestURL(t, "https://emby.example"),
+	)
+	if err != nil || source == nil || source.URL == "" {
+		t.Fatalf("direct source = (%#v, %v)", source, err)
+	}
+}
+
+type playbackInfoResultClient struct {
+	emby.UnimplementedEmbyServer
+	response *emby.PlaybackInfoResp
+	err      error
+}
+
+func (c *playbackInfoResultClient) PlaybackInfo(
+	context.Context,
+	*emby.PlaybackInfoReq,
+) (*emby.PlaybackInfoResp, error) {
+	return c.response, c.err
 }
 
 func TestProcessEmbySubtitlesListsEverySubtitleAsAuthenticatedVTTFallback(t *testing.T) {
@@ -228,6 +358,35 @@ func TestNewEmbySubtitleCacheInitFuncFetchesBody(t *testing.T) {
 	}
 }
 
+func TestEmbyDiagnosticErrorClassificationIsStableAndRedacted(t *testing.T) {
+	const secret = "diagnostic-secret"
+	cause := errors.New("https://private.example/item?api_key=" + secret)
+	err := NewEmbyDiagnosticError("subtitle_cache_fetch_failed", cause)
+
+	if got := EmbyDiagnosticErrorCategory(err); got != "subtitle_cache_fetch_failed" {
+		t.Fatalf("category = %q", got)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("diagnostic error did not preserve cause")
+	}
+	assertRedactedSubtitleError(t, err, []string{"private.example", "api_key", secret})
+}
+
+func TestNewEmbySubtitleCacheInitFuncClassifiesUpstreamStatus(t *testing.T) {
+	const secret = "status-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "sensitive response "+secret, http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	_, err := newEmbySubtitleCacheInitFunc(server.URL + "/private?api_key=" + secret)(context.Background())
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok || details.Category != "subtitle_upstream_status" || details.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
+	}
+	assertRedactedSubtitleError(t, err, []string{server.URL, "private", "api_key", secret, "sensitive response"})
+}
+
 func TestNewEmbySubtitleCacheInitFuncRejectsOversizedResponses(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -260,6 +419,9 @@ func TestNewEmbySubtitleCacheInitFuncRejectsOversizedResponses(t *testing.T) {
 			_, err := newEmbySubtitleCacheInitFunc(server.URL + "/subtitle.vtt")(context.Background())
 			if err == nil || err.Error() != "subtitle response too large" {
 				t.Fatalf("error = %v, want fixed oversized error", err)
+			}
+			if category := EmbyDiagnosticErrorCategory(err); category != "subtitle_response_too_large" {
+				t.Fatalf("category = %q, want subtitle_response_too_large", category)
 			}
 			assertRedactedSubtitleError(t, err, []string{server.URL, "subtitle.vtt"})
 		})

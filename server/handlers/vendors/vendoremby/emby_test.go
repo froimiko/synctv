@@ -18,6 +18,7 @@ import (
 	dbModel "github.com/synctv-org/synctv/internal/model"
 	"github.com/synctv-org/synctv/internal/op"
 	"github.com/synctv-org/synctv/server/model"
+	"github.com/zijiren233/gencontainer/refreshcache0"
 )
 
 func TestDynamicMovieEmbyCredentialsFromCache(t *testing.T) {
@@ -126,6 +127,122 @@ func TestHandleEmbySubtitleRejectsRepeatedIndexesAfterGrant(t *testing.T) {
 		)
 		if !errors.Is(err, errInvalidSubtitleQuery) || fetchCalled {
 			t.Errorf("query %q: err = %v, fetchCalled = %v", rawQuery, err, fetchCalled)
+		}
+	}
+}
+
+func TestHandleEmbySubtitleFailsClosedOnMalformedCacheData(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	initializedCache := refreshcache0.NewRefreshCache(
+		func(context.Context) ([]byte, error) { return []byte("WEBVTT"), nil },
+		-1,
+	)
+	tests := []struct {
+		name         string
+		cached       *cache.EmbyMovieCacheData
+		wantCategory string
+		wantSources  int
+		wantSubs     int
+	}{
+		{
+			name:         "nil movie cache",
+			cached:       nil,
+			wantCategory: "media_source_processing_failed",
+			wantSources:  0,
+			wantSubs:     -1,
+		},
+		{
+			name: "nil subtitle",
+			cached: &cache.EmbyMovieCacheData{Sources: []cache.EmbySource{{
+				Subtitles: []*cache.EmbySubtitleCache{nil},
+			}}},
+			wantCategory: "subtitle_cache_fetch_failed",
+			wantSources:  1,
+			wantSubs:     1,
+		},
+		{
+			name: "nil subtitle cache",
+			cached: &cache.EmbyMovieCacheData{Sources: []cache.EmbySource{{
+				Subtitles: []*cache.EmbySubtitleCache{{}},
+			}}},
+			wantCategory: "subtitle_cache_fetch_failed",
+			wantSources:  1,
+			wantSubs:     1,
+		},
+		{
+			name: "initialized subtitle cache reaches fetch",
+			cached: &cache.EmbyMovieCacheData{Sources: []cache.EmbySource{{
+				Subtitles: []*cache.EmbySubtitleCache{{Cache: initializedCache}},
+			}}},
+			wantCategory: "",
+			wantSources:  -1,
+			wantSubs:     -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodGet, "/?source=0&id=0", nil)
+			values, err := url.ParseQuery(ctx.Request.URL.RawQuery)
+			if err != nil {
+				t.Fatalf("parse query: %v", err)
+			}
+			fetchCalled := false
+			err = handleEmbySubtitle(
+				ctx,
+				values,
+				func(context.Context) (*cache.EmbyMovieCacheData, error) { return tt.cached, nil },
+				func(context.Context, *cache.EmbySubtitleCache) ([]byte, error) {
+					fetchCalled = true
+					return []byte("WEBVTT"), nil
+				},
+			)
+			if tt.wantCategory == "" {
+				if err != nil || !fetchCalled {
+					t.Fatalf("valid cache result = (%v, fetchCalled=%v)", err, fetchCalled)
+				}
+				return
+			}
+			if fetchCalled {
+				t.Fatal("fetch ran for malformed cache data")
+			}
+			details, ok := cache.EmbyDiagnosticDetailsFromError(err)
+			if !ok || details.Category != tt.wantCategory ||
+				details.SourceCount != tt.wantSources || details.SubtitleCount != tt.wantSubs {
+				t.Fatalf("details = %#v, ok = %v", details, ok)
+			}
+		})
+	}
+}
+
+func TestHandleEmbySubtitleClassifiesGenericCacheFetchFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/?source=0&id=0", nil)
+	values, err := url.ParseQuery(ctx.Request.URL.RawQuery)
+	if err != nil {
+		t.Fatalf("parse query: %v", err)
+	}
+	initializedCache := refreshcache0.NewRefreshCache(
+		func(context.Context) ([]byte, error) { return nil, nil },
+		-1,
+	)
+	cached := &cache.EmbyMovieCacheData{Sources: []cache.EmbySource{{
+		Subtitles: []*cache.EmbySubtitleCache{{Cache: initializedCache}},
+	}}}
+	cause := errors.New("https://private.example/subtitle?api_key=secret")
+
+	err = handleEmbySubtitle(ctx, values,
+		func(context.Context) (*cache.EmbyMovieCacheData, error) { return cached, nil },
+		func(context.Context, *cache.EmbySubtitleCache) ([]byte, error) { return nil, cause },
+	)
+	if cache.EmbyDiagnosticErrorCategory(err) != "subtitle_cache_fetch_failed" || !errors.Is(err, cause) {
+		t.Fatalf("error = %v, category = %q", err, cache.EmbyDiagnosticErrorCategory(err))
+	}
+	for _, sensitive := range []string{"private.example", "api_key", "secret"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error leaked %q: %q", sensitive, err)
 		}
 	}
 }
@@ -662,6 +779,33 @@ func TestWriteEmbyAccessErrorDoesNotLeakSensitiveDetails(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
+	const secret = "log-secret"
+	logger := log.New()
+	var output strings.Builder
+	logger.SetOutput(&output)
+	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+
+	err := cache.NewEmbyDiagnosticError("subtitle_cache_fetch_failed", errors.New(
+		"https://private.example/subtitle?api_key="+secret,
+	))
+	embyDiagnosticLogEntry(logger.WithFields(log.Fields{
+		"uid":   "raw-user-id",
+		"rid":   "raw-room-id",
+		"token": secret,
+	}), err).Error("emby subtitle request failed")
+
+	got := output.String()
+	if !strings.Contains(got, "category=subtitle_cache_fetch_failed") {
+		t.Fatalf("log missing category: %q", got)
+	}
+	for _, sensitive := range []string{"private.example", "api_key", secret, "raw-user-id", "raw-room-id", "uid=", "rid="} {
+		if strings.Contains(got, sensitive) {
+			t.Fatalf("log leaked %q: %q", sensitive, got)
+		}
 	}
 }
 

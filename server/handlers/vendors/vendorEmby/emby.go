@@ -65,6 +65,13 @@ func embyDiagnosticLogEntry(logger *log.Entry, err error) *log.Entry {
 	if details.SubtitleCount >= 0 {
 		fields["subtitle_count"] = details.SubtitleCount
 	}
+	if details.RouteSource == "delivery_url" || details.RouteSource == "vtt_fallback" || details.RouteSource == "none" {
+		fields["route_source"] = details.RouteSource
+		fields["delivery_url_present"] = details.DeliveryURLPresent
+		fields["delivery_url_accepted"] = details.DeliveryURLAccepted
+		fields["api_prefix_added"] = details.APIPrefixAdded
+		fields["fallback_available"] = details.FallbackAvailable
+	}
 	return embyDiagnosticBaseLogEntry(logger).WithFields(fields)
 }
 
@@ -491,11 +498,11 @@ func handleEmbySubtitle(
 	data, err := fetch(ctx, subtitle)
 	if err != nil {
 		if cache.EmbyDiagnosticErrorCategory(err) == "" {
-			err = cache.NewEmbyDiagnosticErrorWithCounts(
+			err = cache.NewEmbySubtitleDiagnosticError(
 				"subtitle_cache_fetch_failed",
 				err,
+				subtitle,
 				len(embyC.Sources),
-				-1,
 				len(embyC.Sources[source].Subtitles),
 			)
 		}

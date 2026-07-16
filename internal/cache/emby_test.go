@@ -240,14 +240,46 @@ func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
 		wantContentType string
 	}{
 		{
-			name:            "root relative with false text flag",
-			deliveryURL:     "/emby/Videos/real-item/real-source/Subtitles/91/Stream.srt?foo=keep&API_KEY=old-a&api_Key=old-b&X-EMBY-TOKEN=old-c",
+			name:            "root relative Videos gets emby prefix",
+			deliveryURL:     "/Videos/real-item/real-source/Subtitles/91/Stream.srt?foo=keep&API_KEY=old-a&api_Key=old-b&X-EMBY-TOKEN=old-c",
 			isText:          false,
 			deliveryMethod:  "External",
 			wantScheme:      "https",
 			wantHost:        "emby.example",
 			wantPath:        "/emby/Videos/real-item/real-source/Subtitles/91/Stream.srt",
 			wantQuery:       url.Values{"api_key": {testEmbyAPIKey}, "foo": {"keep"}},
+			wantType:        "srt",
+			wantContentType: "application/x-subrip; charset=utf-8",
+		},
+		{
+			name:            "root relative already under emby is not duplicated",
+			deliveryURL:     "/emby/Videos/prefixed-item/prefixed-source/Subtitles/17/Stream.srt?foo=prefixed&api_key=old",
+			isText:          true,
+			deliveryMethod:  "External",
+			wantScheme:      "https",
+			wantHost:        "emby.example",
+			wantPath:        "/emby/Videos/prefixed-item/prefixed-source/Subtitles/17/Stream.srt",
+			wantQuery:       url.Values{"api_key": {testEmbyAPIKey}, "foo": {"prefixed"}},
+			wantType:        "srt",
+			wantContentType: "application/x-subrip; charset=utf-8",
+		},
+		{
+			name:            "exact Videos path gets emby prefix",
+			deliveryURL:     "/Videos?mode=exact",
+			wantScheme:      "https",
+			wantHost:        "emby.example",
+			wantPath:        "/emby/Videos",
+			wantQuery:       url.Values{"api_key": {testEmbyAPIKey}, "mode": {"exact"}},
+			wantType:        "vtt",
+			wantContentType: "text/vtt; charset=utf-8",
+		},
+		{
+			name:            "VideosExtra path does not get emby prefix",
+			deliveryURL:     "/VideosExtra/stream.srt?mode=boundary",
+			wantScheme:      "https",
+			wantHost:        "emby.example",
+			wantPath:        "/VideosExtra/stream.srt",
+			wantQuery:       url.Values{"api_key": {testEmbyAPIKey}, "mode": {"boundary"}},
 			wantType:        "srt",
 			wantContentType: "application/x-subrip; charset=utf-8",
 		},
@@ -264,13 +296,13 @@ func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
 			wantContentType: "text/vtt; charset=utf-8",
 		},
 		{
-			name:            "same origin absolute normalizes default port",
-			deliveryURL:     "https://emby.example:443/subtitles/direct.ass?mode=direct&Api_Key=old&X-Emby-Token=old",
+			name:            "same origin absolute Videos gets emby prefix",
+			deliveryURL:     "https://emby.example:443/Videos/absolute-item/absolute-source/Subtitles/23/Stream.ass?mode=direct&Api_Key=old&X-Emby-Token=old",
 			isText:          false,
 			deliveryMethod:  "Unknown",
 			wantScheme:      "https",
 			wantHost:        "emby.example:443",
-			wantPath:        "/subtitles/direct.ass",
+			wantPath:        "/emby/Videos/absolute-item/absolute-source/Subtitles/23/Stream.ass",
 			wantQuery:       url.Values{"api_key": {testEmbyAPIKey}, "mode": {"direct"}},
 			wantType:        "ass",
 			wantContentType: "text/x-ssa; charset=utf-8",
@@ -332,15 +364,15 @@ func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
 			got := processEmbySubtitles(
 				&emby.MediaSourceInfo{Id: "fallback-source", MediaStreamInfo: []*emby.MediaStreamInfo{
 					{
-						Type:                     "Subtitle",
-						Index:                    streamIndex,
-						DeliveryUrl:              tt.deliveryURL,
-						DeliveryMethod:           tt.deliveryMethod,
-						Codec:                    tt.codec,
-						MimeType:                 tt.mimeType,
-						IsTextSubtitleStream:     tt.isText,
-						SupportsExternalStream:   false,
-						SubtitleLocationType:     "Unknown",
+						Type:                   "Subtitle",
+						Index:                  streamIndex,
+						DeliveryUrl:            tt.deliveryURL,
+						DeliveryMethod:         tt.deliveryMethod,
+						Codec:                  tt.codec,
+						MimeType:               tt.mimeType,
+						IsTextSubtitleStream:   tt.isText,
+						SupportsExternalStream: false,
+						SubtitleLocationType:   "Unknown",
 					},
 				}},
 				"fallback-item", testEmbyAPIKey, base,
@@ -350,8 +382,11 @@ func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
 				t.Fatalf("subtitles = %#v, want one initialized entry", got)
 			}
 			parsed := mustTestURL(t, got[0].URL)
-			if parsed.Scheme != tt.wantScheme || parsed.Host != tt.wantHost || parsed.Path != tt.wantPath {
-				t.Fatalf("delivery URL = %q, want %s://%s%s", got[0].URL, tt.wantScheme, tt.wantHost, tt.wantPath)
+			if parsed.Scheme != tt.wantScheme || parsed.Host != tt.wantHost {
+				t.Fatalf("delivery origin = %s://%s, want %s://%s", parsed.Scheme, parsed.Host, tt.wantScheme, tt.wantHost)
+			}
+			if parsed.Path != tt.wantPath {
+				t.Fatalf("delivery path = %q, want %q", parsed.Path, tt.wantPath)
 			}
 			assertCanonicalEmbyAPIKey(t, parsed.Query(), tt.wantQuery)
 			if got[0].Type != tt.wantType || got[0].ContentType != tt.wantContentType {

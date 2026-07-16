@@ -586,6 +586,12 @@ func embySubtitleDeliveryURL(base *url.URL, rawURL, apiKey string) (*url.URL, bo
 	if err != nil {
 		return nil, false
 	}
+	if resolved.Path == "/Videos" || strings.HasPrefix(resolved.Path, "/Videos/") {
+		resolved.Path = "/emby" + resolved.Path
+		if resolved.RawPath != "" {
+			resolved.RawPath = "/emby" + resolved.RawPath
+		}
+	}
 	setCanonicalEmbyAPIKey(resolved, query, apiKey)
 	return resolved, true
 }

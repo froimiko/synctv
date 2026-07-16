@@ -680,14 +680,24 @@ func embySubtitleFormat(deliveryURL *url.URL, codec, mimeType string) (string, s
 	return "vtt", "text/vtt; charset=utf-8"
 }
 
-func embySubtitleFallbackURL(base *url.URL, itemID, sourceID string, index uint64, apiKey string) (*url.URL, bool) {
+func embySubtitleFallbackFormat(codec, mimeType string) (string, string, bool) {
+	if subtitleType, contentType, ok := embySubtitleFormatValue(codec); ok {
+		return subtitleType, contentType, true
+	}
+	if mediaType, _, err := mime.ParseMediaType(mimeType); err == nil {
+		return embySubtitleFormatValue(mediaType)
+	}
+	return "", "", false
+}
+
+func embySubtitleFallbackURL(base *url.URL, itemID, sourceID string, index uint64, apiKey, subtitleType string) (*url.URL, bool) {
 	if !validEmbySubtitleBaseURL(base) {
 		return nil, false
 	}
 
 	fallback := *base
 	reference := &url.URL{Path: path.Join(
-		"/emby", "Videos", itemID, sourceID, "Subtitles", strconv.FormatUint(index, 10), "Stream.vtt",
+		"/emby", "Videos", itemID, sourceID, "Subtitles", strconv.FormatUint(index, 10), "Stream."+subtitleType,
 	)}
 	fallback = *base.ResolveReference(reference)
 	fallback.RawPath = ""
@@ -713,17 +723,21 @@ func processEmbySubtitles(
 			continue
 		}
 
-		subtitleType := "vtt"
-		contentType := "text/vtt; charset=utf-8"
+		subtitleType := ""
+		contentType := ""
 		subtitleURLString := ""
 		route := embySubtitleRouteDetails{
 			RouteSource:        "none",
 			DeliveryURLPresent: msi.GetDeliveryUrl() != "",
 		}
-		if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey); ok {
-			subtitleURLString = fallback.String()
-			route.RouteSource = "vtt_fallback"
-			route.FallbackAvailable = true
+		if fallbackType, fallbackContentType, supported := embySubtitleFallbackFormat(msi.GetCodec(), msi.GetMimeType()); supported {
+			if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey, fallbackType); ok {
+				subtitleURLString = fallback.String()
+				subtitleType = fallbackType
+				contentType = fallbackContentType
+				route.RouteSource = "vtt_fallback"
+				route.FallbackAvailable = true
+			}
 		}
 		if deliveryURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
 			subtitleURLString = deliveryURL.String()

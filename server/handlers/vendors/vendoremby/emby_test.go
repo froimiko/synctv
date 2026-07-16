@@ -782,6 +782,76 @@ func TestWriteEmbyAccessErrorDoesNotLeakSensitiveDetails(t *testing.T) {
 	}
 }
 
+func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cause := errors.New("upstream URL and credentials must stay isolated")
+	err := cache.NewEmbySubtitleDiagnosticError(
+		"subtitle_upstream_status",
+		cause,
+		&cache.EmbySubtitleCache{
+			RouteSource:         "delivery_url",
+			DeliveryURLPresent:  true,
+			DeliveryURLAccepted: true,
+			FallbackAvailable:   true,
+		},
+		1,
+		1,
+	)
+
+	logger := log.New()
+	var output strings.Builder
+	logger.SetOutput(&output)
+	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	writeEmbyAccessError(ctx, logger.WithField("token", "secret"), err, "failed to load subtitle")
+
+	got := output.String()
+	for _, field := range []string{"category=subtitle_upstream_status", "route_source=delivery_url", "delivery_url_present=true", "delivery_url_accepted=true", "fallback_available=true"} {
+		if !strings.Contains(got, field) {
+			t.Fatalf("log missing %q: %q", field, got)
+		}
+	}
+	for _, forbidden := range []string{"upstream URL", "credentials", "token=", "secret"} {
+		if strings.Contains(got, forbidden) || strings.Contains(recorder.Body.String(), forbidden) {
+			t.Fatalf("diagnostic output leaked %q: log=%q body=%q", forbidden, got, recorder.Body.String())
+		}
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", recorder.Code)
+	}
+	var resp model.APIResp
+	if decodeErr := json.Unmarshal(recorder.Body.Bytes(), &resp); decodeErr != nil {
+		t.Fatalf("decode response: %v", decodeErr)
+	}
+	if resp.Error != "failed to load subtitle" {
+		t.Fatalf("error = %q, want fixed handler error", resp.Error)
+	}
+}
+
+func TestEmbyDiagnosticLogEntryOmitsRouteBooleansForInvalidOrEmptySource(t *testing.T) {
+	for _, routeSource := range []string{"", "invalid"} {
+		t.Run(routeSource, func(t *testing.T) {
+			logger := log.New()
+			var output strings.Builder
+			logger.SetOutput(&output)
+			logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+			err := cache.NewEmbySubtitleDiagnosticError("subtitle_upstream_status", nil, &cache.EmbySubtitleCache{
+				RouteSource: routeSource, DeliveryURLPresent: true, DeliveryURLAccepted: true,
+				APIPrefixAdded: true, FallbackAvailable: true,
+			}, 1, 1)
+
+			embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
+			got := output.String()
+			for _, forbidden := range []string{"route_source=", "delivery_url_present=", "delivery_url_accepted=", "api_prefix_added=", "fallback_available="} {
+				if strings.Contains(got, forbidden) {
+					t.Fatalf("invalid route source emitted %q: %q", forbidden, got)
+				}
+			}
+		})
+	}
+}
+
 func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 	const secret = "log-secret"
 	logger := log.New()
@@ -789,9 +859,19 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 	logger.SetOutput(&output)
 	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
 
-	err := cache.NewEmbyDiagnosticError("subtitle_cache_fetch_failed", errors.New(
-		"https://private.example/subtitle?api_key="+secret,
-	))
+	err := cache.NewEmbySubtitleDiagnosticError(
+		"subtitle_upstream_status",
+		errors.New("https://private.example/subtitle?api_key="+secret),
+		&cache.EmbySubtitleCache{
+			RouteSource:         "delivery_url",
+			DeliveryURLPresent:  true,
+			DeliveryURLAccepted: true,
+			APIPrefixAdded:      true,
+			FallbackAvailable:   true,
+		},
+		1,
+		1,
+	)
 	embyDiagnosticLogEntry(logger.WithFields(log.Fields{
 		"uid":   "raw-user-id",
 		"rid":   "raw-room-id",
@@ -799,10 +879,19 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 	}), err).Error("emby subtitle request failed")
 
 	got := output.String()
-	if !strings.Contains(got, "category=subtitle_cache_fetch_failed") {
-		t.Fatalf("log missing category: %q", got)
+	for _, field := range []string{
+		"category=subtitle_upstream_status",
+		"route_source=delivery_url",
+		"delivery_url_present=true",
+		"delivery_url_accepted=true",
+		"api_prefix_added=true",
+		"fallback_available=true",
+	} {
+		if !strings.Contains(got, field) {
+			t.Fatalf("log missing %q: %q", field, got)
+		}
 	}
-	for _, sensitive := range []string{"private.example", "api_key", secret, "raw-user-id", "raw-room-id", "uid=", "rid="} {
+	for _, sensitive := range []string{"private.example", "api_key", secret, "raw-user-id", "raw-room-id", "uid=", "rid=", "token="} {
 		if strings.Contains(got, sensitive) {
 			t.Fatalf("log leaked %q: %q", sensitive, got)
 		}

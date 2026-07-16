@@ -74,11 +74,16 @@ type EmbySource struct {
 }
 
 type EmbySubtitleCache struct {
-	Cache       *refreshcache0.RefreshCache[[]byte]
-	URL         string
-	Type        string
-	Name        string
-	ContentType string
+	Cache               *refreshcache0.RefreshCache[[]byte]
+	URL                 string
+	Type                string
+	Name                string
+	ContentType         string
+	RouteSource         string
+	DeliveryURLPresent  bool
+	DeliveryURLAccepted bool
+	APIPrefixAdded      bool
+	FallbackAvailable   bool
 }
 
 type EmbyMovieCacheData struct {
@@ -87,12 +92,33 @@ type EmbyMovieCacheData struct {
 }
 
 type EmbyDiagnosticDetails struct {
-	Category         string
-	HTTPStatus       int
-	Timeout          bool
-	SourceCount      int
-	MediaStreamCount int
-	SubtitleCount    int
+	Category            string
+	HTTPStatus          int
+	Timeout             bool
+	SourceCount         int
+	MediaStreamCount    int
+	SubtitleCount       int
+	RouteSource         string
+	DeliveryURLPresent  bool
+	DeliveryURLAccepted bool
+	APIPrefixAdded      bool
+	FallbackAvailable   bool
+}
+
+type embySubtitleRouteDetails struct {
+	RouteSource         string
+	DeliveryURLPresent  bool
+	DeliveryURLAccepted bool
+	APIPrefixAdded      bool
+	FallbackAvailable   bool
+}
+
+func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
+	details.RouteSource = route.RouteSource
+	details.DeliveryURLPresent = route.DeliveryURLPresent
+	details.DeliveryURLAccepted = route.DeliveryURLAccepted
+	details.APIPrefixAdded = route.APIPrefixAdded
+	details.FallbackAvailable = route.FallbackAvailable
 }
 
 type embyDiagnosticError struct {
@@ -146,6 +172,32 @@ func NewEmbyDiagnosticErrorWithCounts(
 			details.SourceCount = sourceCount
 			details.MediaStreamCount = mediaStreamCount
 			details.SubtitleCount = subtitleCount
+		},
+	)
+}
+
+func NewEmbySubtitleDiagnosticError(
+	category string,
+	cause error,
+	subtitle *EmbySubtitleCache,
+	sourceCount, subtitleCount int,
+) error {
+	return newEmbyDiagnosticErrorWithDetails(
+		category,
+		"emby media request failed",
+		cause,
+		func(details *EmbyDiagnosticDetails) {
+			details.SourceCount = sourceCount
+			details.SubtitleCount = subtitleCount
+			if subtitle != nil {
+				embySubtitleRouteDetails{
+					RouteSource:         subtitle.RouteSource,
+					DeliveryURLPresent:  subtitle.DeliveryURLPresent,
+					DeliveryURLAccepted: subtitle.DeliveryURLAccepted,
+					APIPrefixAdded:      subtitle.APIPrefixAdded,
+					FallbackAvailable:   subtitle.FallbackAvailable,
+				}.apply(details)
+			}
 		},
 	)
 }
@@ -559,41 +611,42 @@ func setCanonicalEmbyAPIKey(u *url.URL, query url.Values, apiKey string) {
 	u.RawQuery = query.Encode()
 }
 
-func embySubtitleDeliveryURL(base *url.URL, rawURL, apiKey string) (*url.URL, bool) {
+func embySubtitleDeliveryURL(base *url.URL, rawURL, apiKey string) (*url.URL, bool, bool) {
 	if rawURL == "" || !validEmbySubtitleBaseURL(base) {
-		return nil, false
+		return nil, false, false
 	}
 
 	reference, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
 	resolved := base.ResolveReference(reference)
 	if resolved.User != nil || resolved.Fragment != "" || resolved.Hostname() == "" ||
 		(!strings.EqualFold(resolved.Scheme, "http") && !strings.EqualFold(resolved.Scheme, "https")) ||
 		!strings.EqualFold(resolved.Scheme, base.Scheme) ||
 		!strings.EqualFold(resolved.Hostname(), base.Hostname()) {
-		return nil, false
+		return nil, false, false
 	}
 
 	basePort, basePortOK := embyEffectivePort(base)
 	resolvedPort, resolvedPortOK := embyEffectivePort(resolved)
 	if !basePortOK || !resolvedPortOK || basePort != resolvedPort {
-		return nil, false
+		return nil, false, false
 	}
 
 	query, err := url.ParseQuery(resolved.RawQuery)
 	if err != nil {
-		return nil, false
+		return nil, false, false
 	}
-	if resolved.Path == "/Videos" || strings.HasPrefix(resolved.Path, "/Videos/") {
+	apiPrefixAdded := resolved.Path == "/Videos" || strings.HasPrefix(resolved.Path, "/Videos/")
+	if apiPrefixAdded {
 		resolved.Path = "/emby" + resolved.Path
 		if resolved.RawPath != "" {
 			resolved.RawPath = "/emby" + resolved.RawPath
 		}
 	}
 	setCanonicalEmbyAPIKey(resolved, query, apiKey)
-	return resolved, true
+	return resolved, true, apiPrefixAdded
 }
 
 func embySubtitleFormatValue(value string) (string, string, bool) {
@@ -663,12 +716,21 @@ func processEmbySubtitles(
 		subtitleType := "vtt"
 		contentType := "text/vtt; charset=utf-8"
 		subtitleURLString := ""
+		route := embySubtitleRouteDetails{
+			RouteSource:        "none",
+			DeliveryURLPresent: msi.GetDeliveryUrl() != "",
+		}
 		if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey); ok {
 			subtitleURLString = fallback.String()
+			route.RouteSource = "vtt_fallback"
+			route.FallbackAvailable = true
 		}
-		if deliveryURL, ok := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
+		if deliveryURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
 			subtitleURLString = deliveryURL.String()
 			subtitleType, contentType = embySubtitleFormat(deliveryURL, msi.GetCodec(), msi.GetMimeType())
+			route.RouteSource = "delivery_url"
+			route.DeliveryURLAccepted = true
+			route.APIPrefixAdded = apiPrefixAdded
 		}
 
 		name := msi.GetDisplayTitle()
@@ -681,11 +743,18 @@ func processEmbySubtitles(
 		}
 
 		subtitles = append(subtitles, &EmbySubtitleCache{
-			URL:         subtitleURLString,
-			Type:        subtitleType,
-			Name:        name,
-			ContentType: contentType,
-			Cache:       refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(subtitleURLString), -1),
+			URL:                 subtitleURLString,
+			Type:                subtitleType,
+			Name:                name,
+			ContentType:         contentType,
+			RouteSource:         route.RouteSource,
+			DeliveryURLPresent:  route.DeliveryURLPresent,
+			DeliveryURLAccepted: route.DeliveryURLAccepted,
+			APIPrefixAdded:      route.APIPrefixAdded,
+			FallbackAvailable:   route.FallbackAvailable,
+			Cache: refreshcache0.NewRefreshCache(
+				newEmbySubtitleCacheInitFunc(subtitleURLString, route), -1,
+			),
 		})
 	}
 
@@ -704,23 +773,31 @@ func newEmbySubtitleHTTPClient() *http.Client {
 	}
 }
 
-func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]byte, error) {
+func newEmbySubtitleCacheInitFunc(rawURL string, routes ...embySubtitleRouteDetails) func(ctx context.Context) ([]byte, error) {
 	client := newEmbySubtitleHTTPClient()
+	route := embySubtitleRouteDetails{RouteSource: "none"}
+	if len(routes) != 0 {
+		route = routes[0]
+	}
+	newDiagnosticError := func(category, message string, cause error, configure func(*EmbyDiagnosticDetails)) error {
+		return newEmbyDiagnosticErrorWithDetails(category, message, cause, func(details *EmbyDiagnosticDetails) {
+			route.apply(details)
+			if configure != nil {
+				configure(details)
+			}
+		})
+	}
 	return func(ctx context.Context) ([]byte, error) {
 		if rawURL == "" {
-			return nil, newEmbyDiagnosticError(
-				"subtitle_cache_fetch_failed",
-				"subtitle cache fetch failed",
-				nil,
+			return nil, newDiagnosticError(
+				"subtitle_cache_fetch_failed", "subtitle cache fetch failed", nil, nil,
 			)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
-			return nil, newEmbyDiagnosticError(
-				"subtitle_upstream_request_failed",
-				"failed to create subtitle request",
-				err,
+			return nil, newDiagnosticError(
+				"subtitle_upstream_request_failed", "failed to create subtitle request", err, nil,
 			)
 		}
 
@@ -736,7 +813,7 @@ func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]by
 				timeout = true
 				category = "subtitle_upstream_timeout"
 			}
-			return nil, newEmbyDiagnosticErrorWithDetails(
+			return nil, newDiagnosticError(
 				category,
 				"failed to fetch subtitle",
 				err,
@@ -748,7 +825,7 @@ func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]by
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, newEmbyDiagnosticErrorWithDetails(
+			return nil, newDiagnosticError(
 				"subtitle_upstream_status",
 				fmt.Sprintf("unexpected subtitle status: %d", resp.StatusCode),
 				nil,
@@ -758,25 +835,28 @@ func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]by
 			)
 		}
 		if resp.ContentLength > subtitleMaxLength {
-			return nil, newEmbyDiagnosticError(
+			return nil, newDiagnosticError(
 				"subtitle_response_too_large",
 				"subtitle response too large",
+				nil,
 				nil,
 			)
 		}
 
 		data, err := io.ReadAll(io.LimitReader(resp.Body, subtitleMaxLength+1))
 		if err != nil {
-			return nil, newEmbyDiagnosticError(
+			return nil, newDiagnosticError(
 				"subtitle_upstream_read_failed",
 				"failed to read subtitle",
 				err,
+				nil,
 			)
 		}
 		if len(data) > subtitleMaxLength {
-			return nil, newEmbyDiagnosticError(
+			return nil, newDiagnosticError(
 				"subtitle_response_too_large",
 				"subtitle response too large",
+				nil,
 				nil,
 			)
 		}

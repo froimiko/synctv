@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"path"
@@ -558,6 +559,68 @@ func setCanonicalEmbyAPIKey(u *url.URL, query url.Values, apiKey string) {
 	u.RawQuery = query.Encode()
 }
 
+func embySubtitleDeliveryURL(base *url.URL, rawURL, apiKey string) (*url.URL, bool) {
+	if rawURL == "" || !validEmbySubtitleBaseURL(base) {
+		return nil, false
+	}
+
+	reference, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, false
+	}
+	resolved := base.ResolveReference(reference)
+	if resolved.User != nil || resolved.Fragment != "" || resolved.Hostname() == "" ||
+		(!strings.EqualFold(resolved.Scheme, "http") && !strings.EqualFold(resolved.Scheme, "https")) ||
+		!strings.EqualFold(resolved.Scheme, base.Scheme) ||
+		!strings.EqualFold(resolved.Hostname(), base.Hostname()) {
+		return nil, false
+	}
+
+	basePort, basePortOK := embyEffectivePort(base)
+	resolvedPort, resolvedPortOK := embyEffectivePort(resolved)
+	if !basePortOK || !resolvedPortOK || basePort != resolvedPort {
+		return nil, false
+	}
+
+	query, err := url.ParseQuery(resolved.RawQuery)
+	if err != nil {
+		return nil, false
+	}
+	setCanonicalEmbyAPIKey(resolved, query, apiKey)
+	return resolved, true
+}
+
+func embySubtitleFormatValue(value string) (string, string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "vtt", "webvtt", "text/vtt", "text/webvtt":
+		return "vtt", "text/vtt; charset=utf-8", true
+	case "srt", "subrip", "application/x-subrip", "application/subrip", "text/srt":
+		return "srt", "application/x-subrip; charset=utf-8", true
+	case "ass", "ssa", "text/x-ssa", "text/ssa", "text/x-ass", "application/x-ass":
+		return "ass", "text/x-ssa; charset=utf-8", true
+	default:
+		return "", "", false
+	}
+}
+
+func embySubtitleFormat(deliveryURL *url.URL, codec, mimeType string) (string, string) {
+	if deliveryURL != nil {
+		extension := strings.TrimPrefix(path.Ext(deliveryURL.Path), ".")
+		if subtitleType, contentType, ok := embySubtitleFormatValue(extension); ok {
+			return subtitleType, contentType
+		}
+	}
+	if subtitleType, contentType, ok := embySubtitleFormatValue(codec); ok {
+		return subtitleType, contentType
+	}
+	if mediaType, _, err := mime.ParseMediaType(mimeType); err == nil {
+		if subtitleType, contentType, ok := embySubtitleFormatValue(mediaType); ok {
+			return subtitleType, contentType
+		}
+	}
+	return "vtt", "text/vtt; charset=utf-8"
+}
+
 func embySubtitleFallbackURL(base *url.URL, itemID, sourceID string, index uint64, apiKey string) (*url.URL, bool) {
 	if !validEmbySubtitleBaseURL(base) {
 		return nil, false
@@ -591,11 +654,16 @@ func processEmbySubtitles(
 			continue
 		}
 
-		subtitleURL, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey)
-		if !ok {
-			continue
+		subtitleType := "vtt"
+		contentType := "text/vtt; charset=utf-8"
+		subtitleURLString := ""
+		if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey); ok {
+			subtitleURLString = fallback.String()
 		}
-		subtitleURLString := subtitleURL.String()
+		if deliveryURL, ok := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
+			subtitleURLString = deliveryURL.String()
+			subtitleType, contentType = embySubtitleFormat(deliveryURL, msi.GetCodec(), msi.GetMimeType())
+		}
 
 		name := msi.GetDisplayTitle()
 		if name == "" {
@@ -608,9 +676,9 @@ func processEmbySubtitles(
 
 		subtitles = append(subtitles, &EmbySubtitleCache{
 			URL:         subtitleURLString,
-			Type:        "vtt",
+			Type:        subtitleType,
 			Name:        name,
-			ContentType: "text/vtt; charset=utf-8",
+			ContentType: contentType,
 			Cache:       refreshcache0.NewRefreshCache(newEmbySubtitleCacheInitFunc(subtitleURLString), -1),
 		})
 	}
@@ -633,6 +701,14 @@ func newEmbySubtitleHTTPClient() *http.Client {
 func newEmbySubtitleCacheInitFunc(rawURL string) func(ctx context.Context) ([]byte, error) {
 	client := newEmbySubtitleHTTPClient()
 	return func(ctx context.Context) ([]byte, error) {
+		if rawURL == "" {
+			return nil, newEmbyDiagnosticError(
+				"subtitle_cache_fetch_failed",
+				"subtitle cache fetch failed",
+				nil,
+			)
+		}
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, newEmbyDiagnosticError(

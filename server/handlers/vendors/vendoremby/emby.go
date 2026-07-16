@@ -72,6 +72,9 @@ func embyDiagnosticLogEntry(logger *log.Entry, err error) *log.Entry {
 		fields["api_prefix_added"] = details.APIPrefixAdded
 		fields["fallback_available"] = details.FallbackAvailable
 	}
+	if details.FallbackFormatState == "missing" || details.FallbackFormatState == "unsupported" || details.FallbackFormatState == "supported" {
+		fields["fallback_format_state"] = details.FallbackFormatState
+	}
 	return embyDiagnosticBaseLogEntry(logger).WithFields(fields)
 }
 

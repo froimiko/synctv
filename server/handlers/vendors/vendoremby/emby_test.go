@@ -793,10 +793,14 @@ func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T)
 			DeliveryURLPresent:  true,
 			DeliveryURLAccepted: true,
 			FallbackAvailable:   true,
+			FallbackFormatState: "supported",
 		},
 		1,
 		1,
 	)
+	if !errors.Is(err, cause) {
+		t.Fatal("subtitle diagnostic error did not preserve cause")
+	}
 
 	logger := log.New()
 	var output strings.Builder
@@ -807,7 +811,7 @@ func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T)
 	writeEmbyAccessError(ctx, logger.WithField("token", "secret"), err, "failed to load subtitle")
 
 	got := output.String()
-	for _, field := range []string{"category=subtitle_upstream_status", "route_source=delivery_url", "delivery_url_present=true", "delivery_url_accepted=true", "fallback_available=true"} {
+	for _, field := range []string{"category=subtitle_upstream_status", "route_source=delivery_url", "delivery_url_present=true", "delivery_url_accepted=true", "fallback_available=true", "fallback_format_state=supported"} {
 		if !strings.Contains(got, field) {
 			t.Fatalf("log missing %q: %q", field, got)
 		}
@@ -838,7 +842,7 @@ func TestEmbyDiagnosticLogEntryOmitsRouteBooleansForInvalidOrEmptySource(t *test
 			logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
 			err := cache.NewEmbySubtitleDiagnosticError("subtitle_upstream_status", nil, &cache.EmbySubtitleCache{
 				RouteSource: routeSource, DeliveryURLPresent: true, DeliveryURLAccepted: true,
-				APIPrefixAdded: true, FallbackAvailable: true,
+				APIPrefixAdded: true, FallbackAvailable: true, FallbackFormatState: "supported",
 			}, 1, 1)
 
 			embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
@@ -847,6 +851,32 @@ func TestEmbyDiagnosticLogEntryOmitsRouteBooleansForInvalidOrEmptySource(t *test
 				if strings.Contains(got, forbidden) {
 					t.Fatalf("invalid route source emitted %q: %q", forbidden, got)
 				}
+			}
+			if !strings.Contains(got, "fallback_format_state=supported") {
+				t.Fatalf("valid fallback state omitted for invalid route source: %q", got)
+			}
+		})
+	}
+}
+
+func TestEmbyDiagnosticLogEntryAllowsOnlyFallbackFormatStates(t *testing.T) {
+	for _, state := range []string{"missing", "unsupported", "supported", "", "invalid"} {
+		t.Run(state, func(t *testing.T) {
+			logger := log.New()
+			var output strings.Builder
+			logger.SetOutput(&output)
+			logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+			err := cache.NewEmbySubtitleDiagnosticError("subtitle_cache_fetch_failed", nil, &cache.EmbySubtitleCache{
+				RouteSource: "none", FallbackFormatState: state,
+			}, 1, 1)
+			embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
+			got := output.String()
+			if state == "missing" || state == "unsupported" || state == "supported" {
+				if !strings.Contains(got, "fallback_format_state="+state) {
+					t.Fatalf("log missing fallback state %q: %q", state, got)
+				}
+			} else if strings.Contains(got, "fallback_format_state=") {
+				t.Fatalf("invalid fallback state emitted: %q", got)
 			}
 		})
 	}
@@ -859,19 +889,25 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 	logger.SetOutput(&output)
 	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
 
+	cause := errors.New("https://private.example/subtitle?api_key=" + secret)
 	err := cache.NewEmbySubtitleDiagnosticError(
 		"subtitle_upstream_status",
-		errors.New("https://private.example/subtitle?api_key="+secret),
+		cause,
 		&cache.EmbySubtitleCache{
 			RouteSource:         "delivery_url",
 			DeliveryURLPresent:  true,
 			DeliveryURLAccepted: true,
 			APIPrefixAdded:      true,
 			FallbackAvailable:   true,
+			FallbackFormatState: "supported",
 		},
 		1,
 		1,
 	)
+	if !errors.Is(err, cause) {
+		t.Fatal("subtitle diagnostic error did not preserve cause")
+	}
+
 	embyDiagnosticLogEntry(logger.WithFields(log.Fields{
 		"uid":   "raw-user-id",
 		"rid":   "raw-room-id",
@@ -886,6 +922,7 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 		"delivery_url_accepted=true",
 		"api_prefix_added=true",
 		"fallback_available=true",
+		"fallback_format_state=supported",
 	} {
 		if !strings.Contains(got, field) {
 			t.Fatalf("log missing %q: %q", field, got)

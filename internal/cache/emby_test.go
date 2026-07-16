@@ -401,6 +401,19 @@ func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
 	}
 }
 
+func TestProcessEmbySubtitlesSafeDeliveryURLPreservesFallbackFormatState(t *testing.T) {
+	got := processEmbySubtitles(
+		&emby.MediaSourceInfo{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
+			Type: "Subtitle", Codec: "pgssub", MimeType: "image/png", DeliveryUrl: "/subtitle.srt",
+		}}},
+		"item", testEmbyAPIKey, mustTestURL(t, "https://emby.example"),
+	)
+	if len(got) != 1 || got[0] == nil || got[0].RouteSource != "delivery_url" ||
+		got[0].FallbackFormatState != "unsupported" {
+		t.Fatalf("delivery route diagnostics = %#v", got)
+	}
+}
+
 func TestProcessEmbySubtitlesFallsBackForUnsafeDeliveryURLWithoutHidingEntry(t *testing.T) {
 	const streamIndex = uint64(7)
 	tests := []struct {
@@ -522,11 +535,29 @@ func TestProcessEmbySubtitlesKeepsEntryWithoutSelectableUpstreamURL(t *testing.T
 	if len(got) != 1 || got[0] == nil {
 		t.Fatalf("subtitles = %#v, want one selector entry", got)
 	}
+	if got[0].FallbackFormatState != "missing" {
+		t.Fatalf("fallback format state = %q, want missing", got[0].FallbackFormatState)
+	}
 	if got[0].URL != "" {
 		t.Fatalf("subtitle URL = %q, want empty", got[0].URL)
 	}
 	if got[0].Cache == nil {
 		t.Fatal("subtitle cache = nil, want initialized cache")
+	}
+
+	_, err := got[0].Cache.Get(context.Background())
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok || details.Category != "subtitle_cache_fetch_failed" || details.FallbackFormatState != "missing" ||
+		details.RouteSource != "none" || !details.DeliveryURLPresent || details.DeliveryURLAccepted || details.FallbackAvailable {
+		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
+	}
+	if err == nil || err.Error() != "subtitle cache fetch failed" {
+		t.Fatalf("error = %v, want fixed safe error", err)
+	}
+	for _, sensitive := range []string{"other.example", "api_key", "secret"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("error leaked %q: %q", sensitive, err)
+		}
 	}
 }
 
@@ -554,6 +585,27 @@ func TestProcessEmbySubtitlesIgnoresNilAndNonSubtitleStreams(t *testing.T) {
 			)
 			if len(got) != 0 {
 				t.Fatalf("subtitle count = %d, want 0", len(got))
+			}
+		})
+	}
+}
+
+func TestEmbySubtitleFallbackFormatState(t *testing.T) {
+	tests := []struct {
+		name, codec, mimeType, want string
+	}{
+		{"missing", "", "", "missing"},
+		{"unsupported codec", "pgssub", "", "unsupported"},
+		{"invalid mime", "", "not-a-mime", "unsupported"},
+		{"graphic mime", "", "image/png", "unsupported"},
+		{"vtt codec", "vtt", "", "supported"},
+		{"srt mime", "", "application/x-subrip", "supported"},
+		{"ass codec", "ass", "image/png", "supported"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := embySubtitleFallbackFormatState(tt.codec, tt.mimeType); got != tt.want {
+				t.Fatalf("state = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -601,9 +653,13 @@ func TestProcessEmbySubtitlesUnknownFallbackFormatFailsClosed(t *testing.T) {
 	if len(got) != 1 || got[0] == nil || got[0].URL != "" || got[0].FallbackAvailable || got[0].RouteSource != "none" {
 		t.Fatalf("unknown subtitle fallback = %#v, want retained fail-closed entry", got)
 	}
+	if got[0].FallbackFormatState != "unsupported" {
+		t.Fatalf("fallback format state = %q, want unsupported", got[0].FallbackFormatState)
+	}
 	_, err := got[0].Cache.Get(context.Background())
-	if category := EmbyDiagnosticErrorCategory(err); category != "subtitle_cache_fetch_failed" {
-		t.Fatalf("category = %q, want subtitle_cache_fetch_failed", category)
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok || details.Category != "subtitle_cache_fetch_failed" || details.FallbackFormatState != "unsupported" {
+		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
 	}
 }
 

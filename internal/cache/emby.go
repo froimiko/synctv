@@ -84,6 +84,7 @@ type EmbySubtitleCache struct {
 	DeliveryURLAccepted bool
 	APIPrefixAdded      bool
 	FallbackAvailable   bool
+	FallbackFormatState string
 }
 
 type EmbyMovieCacheData struct {
@@ -103,6 +104,7 @@ type EmbyDiagnosticDetails struct {
 	DeliveryURLAccepted bool
 	APIPrefixAdded      bool
 	FallbackAvailable   bool
+	FallbackFormatState string
 }
 
 type embySubtitleRouteDetails struct {
@@ -111,6 +113,7 @@ type embySubtitleRouteDetails struct {
 	DeliveryURLAccepted bool
 	APIPrefixAdded      bool
 	FallbackAvailable   bool
+	FallbackFormatState string
 }
 
 func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
@@ -119,6 +122,7 @@ func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
 	details.DeliveryURLAccepted = route.DeliveryURLAccepted
 	details.APIPrefixAdded = route.APIPrefixAdded
 	details.FallbackAvailable = route.FallbackAvailable
+	details.FallbackFormatState = route.FallbackFormatState
 }
 
 type embyDiagnosticError struct {
@@ -196,6 +200,7 @@ func NewEmbySubtitleDiagnosticError(
 					DeliveryURLAccepted: subtitle.DeliveryURLAccepted,
 					APIPrefixAdded:      subtitle.APIPrefixAdded,
 					FallbackAvailable:   subtitle.FallbackAvailable,
+					FallbackFormatState: subtitle.FallbackFormatState,
 				}.apply(details)
 			}
 		},
@@ -690,6 +695,16 @@ func embySubtitleFallbackFormat(codec, mimeType string) (string, string, bool) {
 	return "", "", false
 }
 
+func embySubtitleFallbackFormatState(codec, mimeType string) string {
+	if strings.TrimSpace(codec) == "" && strings.TrimSpace(mimeType) == "" {
+		return "missing"
+	}
+	if _, _, ok := embySubtitleFallbackFormat(codec, mimeType); ok {
+		return "supported"
+	}
+	return "unsupported"
+}
+
 func embySubtitleFallbackURL(base *url.URL, itemID, sourceID string, index uint64, apiKey, subtitleType string) (*url.URL, bool) {
 	if !validEmbySubtitleBaseURL(base) {
 		return nil, false
@@ -727,8 +742,9 @@ func processEmbySubtitles(
 		contentType := ""
 		subtitleURLString := ""
 		route := embySubtitleRouteDetails{
-			RouteSource:        "none",
-			DeliveryURLPresent: msi.GetDeliveryUrl() != "",
+			RouteSource:         "none",
+			DeliveryURLPresent:  msi.GetDeliveryUrl() != "",
+			FallbackFormatState: embySubtitleFallbackFormatState(msi.GetCodec(), msi.GetMimeType()),
 		}
 		if fallbackType, fallbackContentType, supported := embySubtitleFallbackFormat(msi.GetCodec(), msi.GetMimeType()); supported {
 			if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey, fallbackType); ok {
@@ -766,6 +782,7 @@ func processEmbySubtitles(
 			DeliveryURLAccepted: route.DeliveryURLAccepted,
 			APIPrefixAdded:      route.APIPrefixAdded,
 			FallbackAvailable:   route.FallbackAvailable,
+			FallbackFormatState: route.FallbackFormatState,
 			Cache: refreshcache0.NewRefreshCache(
 				newEmbySubtitleCacheInitFunc(subtitleURLString, route), -1,
 			),

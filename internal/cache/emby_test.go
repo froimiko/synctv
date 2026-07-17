@@ -71,6 +71,9 @@ func assertSingleEmbyFallback(
 	if got[0].Type != subtitleType || got[0].ContentType != contentType {
 		t.Fatalf("subtitle format = (%q, %q), want (%q, %q)", got[0].Type, got[0].ContentType, subtitleType, contentType)
 	}
+	if got[0].TextSubtitleState != "text" || got[0].FallbackFormat != subtitleType {
+		t.Fatalf("fallback diagnostics = (%q, %q), want (text, %s)", got[0].TextSubtitleState, got[0].FallbackFormat, subtitleType)
+	}
 }
 
 func TestProcessMediaSourceDoesNotMutateBase(t *testing.T) {
@@ -409,8 +412,54 @@ func TestProcessEmbySubtitlesSafeDeliveryURLPreservesFallbackFormatState(t *test
 		"item", testEmbyAPIKey, mustTestURL(t, "https://emby.example"),
 	)
 	if len(got) != 1 || got[0] == nil || got[0].RouteSource != "delivery_url" ||
-		got[0].FallbackFormatState != "unsupported" {
-		t.Fatalf("delivery route diagnostics = %#v", got)
+		got[0].FallbackFormatState != "unsupported" || got[0].FallbackAvailable ||
+		got[0].FallbackFormat != "none" || got[0].TextSubtitleState != "non_text" {
+		t.Fatal("safe DeliveryUrl did not preserve the selector and format diagnostics")
+	}
+}
+
+func TestProcessEmbySubtitlesRequiresTextFlagOnlyForConstructedFallback(t *testing.T) {
+	tests := []struct {
+		name         string
+		isText       bool
+		deliveryURL  string
+		wantURL      bool
+		wantFallback bool
+		wantRoute    string
+		wantText     string
+		wantFormat   string
+	}{
+		{"non-text SRT without delivery", false, "", false, false, "none", "non_text", "none"},
+		{"text SRT without delivery", true, "", true, true, "vtt_fallback", "text", "srt"},
+		{"non-text SRT with safe delivery", false, "/subtitle.srt", true, false, "delivery_url", "non_text", "none"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := processEmbySubtitles(&emby.MediaSourceInfo{
+				Id: "source",
+				MediaStreamInfo: []*emby.MediaStreamInfo{{
+					Type: "Subtitle", Codec: "subrip", Index: 7,
+					IsTextSubtitleStream: tt.isText, DeliveryUrl: tt.deliveryURL,
+				}},
+			}, "item", testEmbyAPIKey, mustTestURL(t, "https://emby.example"))
+			if len(got) != 1 || got[0] == nil {
+				t.Fatal("subtitle selector entry was not retained")
+			}
+			if (got[0].URL != "") != tt.wantURL {
+				t.Error("subtitle route URL availability did not match the text gate contract")
+			}
+			if got[0].RouteSource != tt.wantRoute || got[0].FallbackAvailable != tt.wantFallback ||
+				got[0].TextSubtitleState != tt.wantText || got[0].FallbackFormat != tt.wantFormat {
+				t.Error("subtitle route classification did not match the text gate contract")
+			}
+			if !tt.isText && tt.deliveryURL == "" {
+				_, err := got[0].Cache.Get(context.Background())
+				if EmbyDiagnosticErrorCategory(err) != "subtitle_cache_fetch_failed" {
+					t.Errorf("non-text local route category = %q", EmbyDiagnosticErrorCategory(err))
+				}
+			}
+		})
 	}
 }
 
@@ -443,7 +492,7 @@ func TestProcessEmbySubtitlesFallsBackForUnsafeDeliveryURLWithoutHidingEntry(t *
 						DeliveryUrl:          tt.deliveryURL,
 						DeliveryMethod:       "UnrecognizedMethod",
 						Codec:                "vtt",
-						IsTextSubtitleStream: false,
+						IsTextSubtitleStream: true,
 					},
 				}},
 				"real-item", testEmbyAPIKey, base,
@@ -468,8 +517,8 @@ func TestProcessEmbySubtitlesRouteDiagnostics(t *testing.T) {
 		wantPrefix   bool
 		wantFallback bool
 	}{
-		{"delivery accepted with prefix", "https://emby.example/", "/Videos/item/source/Subtitles/1/Stream.vtt", "delivery_url", true, true, true, true},
-		{"delivery accepted without prefix", "https://emby.example/", "/subtitles/one.vtt", "delivery_url", true, true, false, true},
+		{"delivery accepted with prefix", "https://emby.example/", "/Videos/item/source/Subtitles/1/Stream.vtt", "delivery_url", true, true, true, false},
+		{"delivery accepted without prefix", "https://emby.example/", "/subtitles/one.vtt", "delivery_url", true, true, false, false},
 		{"delivery rejected with fallback", "https://emby.example/", "https://other.example/private.vtt", "vtt_fallback", true, false, false, true},
 		{"delivery missing with fallback", "https://emby.example/", "", "vtt_fallback", false, false, false, true},
 		{"none", "file:///invalid", "", "none", false, false, false, false},
@@ -477,7 +526,7 @@ func TestProcessEmbySubtitlesRouteDiagnostics(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := processEmbySubtitles(&emby.MediaSourceInfo{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
-				Type: "Subtitle", Index: 1, DeliveryUrl: tt.deliveryURL, Codec: "vtt",
+				Type: "Subtitle", Index: 1, DeliveryUrl: tt.deliveryURL, Codec: "vtt", IsTextSubtitleStream: true,
 			}}}, "item", testEmbyAPIKey, mustTestURL(t, tt.base))
 			if len(got) != 1 {
 				t.Fatalf("subtitles = %#v", got)
@@ -486,7 +535,7 @@ func TestProcessEmbySubtitlesRouteDiagnostics(t *testing.T) {
 			if subtitle.RouteSource != tt.wantSource || subtitle.DeliveryURLPresent != tt.wantPresent ||
 				subtitle.DeliveryURLAccepted != tt.wantAccepted || subtitle.APIPrefixAdded != tt.wantPrefix ||
 				subtitle.FallbackAvailable != tt.wantFallback {
-				t.Fatalf("route diagnostics = %#v", subtitle)
+				t.Error("route diagnostics did not match the DeliveryUrl/fallback contract")
 			}
 			if tt.wantSource == "none" {
 				_, err := subtitle.Cache.Get(context.Background())
@@ -508,9 +557,13 @@ func TestEmbySubtitleCacheGetPreservesRouteMetadataFromRealUpstream404(t *testin
 	}))
 	defer server.Close()
 
-	got := processEmbySubtitles(&emby.MediaSourceInfo{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
-		Type: "Subtitle", Index: 1, DeliveryUrl: "/subtitle.vtt", Codec: "vtt",
-	}}}, "item", testEmbyAPIKey, mustTestURL(t, server.URL))
+	got := processEmbySubtitles(&emby.MediaSourceInfo{
+		Id: "source", ItemIdPresent: true, ItemIdMatchesRequested: true,
+		MediaStreamInfo: []*emby.MediaStreamInfo{{
+			Type: "Subtitle", Index: 1, DeliveryUrl: "/subtitle.vtt", Codec: "vtt",
+			ItemIdPresent: true, ItemIdMatchesRequested: false,
+		}},
+	}, "item", testEmbyAPIKey, mustTestURL(t, server.URL))
 	if len(got) != 1 || got[0] == nil || got[0].Cache == nil {
 		t.Fatalf("subtitles = %#v, want one initialized entry", got)
 	}
@@ -519,7 +572,9 @@ func TestEmbySubtitleCacheGetPreservesRouteMetadataFromRealUpstream404(t *testin
 	details, ok := EmbyDiagnosticDetailsFromError(err)
 	if !ok || details.Category != "subtitle_upstream_status" || details.HTTPStatus != http.StatusNotFound ||
 		details.RouteSource != "delivery_url" || !details.DeliveryURLPresent || !details.DeliveryURLAccepted ||
-		details.APIPrefixAdded || !details.FallbackAvailable {
+		details.APIPrefixAdded || details.FallbackAvailable || details.TextSubtitleState != "non_text" ||
+		details.FallbackFormat != "none" || !details.SourceItemIDPresent || !details.SourceItemIDMatchesRequested ||
+		!details.StreamItemIDPresent || details.StreamItemIDMatchesRequested {
 		t.Fatalf("404 diagnostic details = %#v, ok = %v", details, ok)
 	}
 }
@@ -535,8 +590,9 @@ func TestProcessEmbySubtitlesKeepsEntryWithoutSelectableUpstreamURL(t *testing.T
 	if len(got) != 1 || got[0] == nil {
 		t.Fatalf("subtitles = %#v, want one selector entry", got)
 	}
-	if got[0].FallbackFormatState != "missing" {
-		t.Fatalf("fallback format state = %q, want missing", got[0].FallbackFormatState)
+	if got[0].FallbackFormatState != "missing" || got[0].TextSubtitleState != "non_text" || got[0].FallbackFormat != "none" {
+		t.Fatalf("fallback diagnostics = (%q, %q, %q), want (missing, non_text, none)",
+			got[0].FallbackFormatState, got[0].TextSubtitleState, got[0].FallbackFormat)
 	}
 	if got[0].URL != "" {
 		t.Fatalf("subtitle URL = %q, want empty", got[0].URL)
@@ -548,7 +604,8 @@ func TestProcessEmbySubtitlesKeepsEntryWithoutSelectableUpstreamURL(t *testing.T
 	_, err := got[0].Cache.Get(context.Background())
 	details, ok := EmbyDiagnosticDetailsFromError(err)
 	if !ok || details.Category != "subtitle_cache_fetch_failed" || details.FallbackFormatState != "missing" ||
-		details.RouteSource != "none" || !details.DeliveryURLPresent || details.DeliveryURLAccepted || details.FallbackAvailable {
+		details.RouteSource != "none" || !details.DeliveryURLPresent || details.DeliveryURLAccepted || details.FallbackAvailable ||
+		details.TextSubtitleState != "non_text" || details.FallbackFormat != "none" {
 		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
 	}
 	if err == nil || err.Error() != "subtitle cache fetch failed" {
@@ -631,7 +688,7 @@ func TestProcessEmbySubtitlesFallbackUsesSupportedTextFormatAndDoesNotMutateBase
 			index := uint64(i + 2)
 			got := processEmbySubtitles(
 				&emby.MediaSourceInfo{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
-					Type: "Subtitle", Codec: tt.codec, MimeType: tt.mimeType, Index: index,
+					Type: "Subtitle", Codec: tt.codec, MimeType: tt.mimeType, Index: index, IsTextSubtitleStream: true,
 				}}},
 				"item", testEmbyAPIKey, base,
 			)
@@ -653,12 +710,14 @@ func TestProcessEmbySubtitlesUnknownFallbackFormatFailsClosed(t *testing.T) {
 	if len(got) != 1 || got[0] == nil || got[0].URL != "" || got[0].FallbackAvailable || got[0].RouteSource != "none" {
 		t.Fatalf("unknown subtitle fallback = %#v, want retained fail-closed entry", got)
 	}
-	if got[0].FallbackFormatState != "unsupported" {
-		t.Fatalf("fallback format state = %q, want unsupported", got[0].FallbackFormatState)
+	if got[0].FallbackFormatState != "unsupported" || got[0].TextSubtitleState != "non_text" || got[0].FallbackFormat != "none" {
+		t.Fatalf("fallback diagnostics = (%q, %q, %q), want (unsupported, non_text, none)",
+			got[0].FallbackFormatState, got[0].TextSubtitleState, got[0].FallbackFormat)
 	}
 	_, err := got[0].Cache.Get(context.Background())
 	details, ok := EmbyDiagnosticDetailsFromError(err)
-	if !ok || details.Category != "subtitle_cache_fetch_failed" || details.FallbackFormatState != "unsupported" {
+	if !ok || details.Category != "subtitle_cache_fetch_failed" || details.FallbackFormatState != "unsupported" ||
+		details.TextSubtitleState != "non_text" || details.FallbackFormat != "none" {
 		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
 	}
 }
@@ -702,7 +761,7 @@ func TestEmbySubtitleCacheGetFetchesCodecSpecificFallback(t *testing.T) {
 			defer server.Close()
 
 			got := processEmbySubtitles(&emby.MediaSourceInfo{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
-				Type: "Subtitle", Index: 7, Codec: tt.codec,
+				Type: "Subtitle", Index: 7, Codec: tt.codec, IsTextSubtitleStream: true,
 			}}}, "item", testEmbyAPIKey, mustTestURL(t, server.URL))
 			if len(got) != 1 || got[0] == nil || got[0].Cache == nil {
 				t.Fatalf("subtitles = %#v, want one initialized fallback", got)
@@ -769,7 +828,7 @@ func TestProcessPlaybackInfoResponseKeepsSubtitleOrderAndRealUpstreamIdentifiers
 					nil,
 					{Type: "Audio", Index: 20},
 					{Type: "Subtitle", Index: 41, DisplayTitle: "Alpha delivery", DeliveryUrl: "/metadata/alpha.srt?keep=alpha"},
-					{Type: "Subtitle", Index: 43, DisplayTitle: "Alpha fallback", DeliveryUrl: "https://other.example/unsafe.vtt", Codec: "vtt"},
+					{Type: "Subtitle", Index: 43, DisplayTitle: "Alpha fallback", DeliveryUrl: "https://other.example/unsafe.vtt", Codec: "vtt", IsTextSubtitleStream: true},
 				},
 			},
 			{

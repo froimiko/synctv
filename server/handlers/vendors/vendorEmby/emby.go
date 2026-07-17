@@ -71,9 +71,19 @@ func embyDiagnosticLogEntry(logger *log.Entry, err error) *log.Entry {
 		fields["delivery_url_accepted"] = details.DeliveryURLAccepted
 		fields["api_prefix_added"] = details.APIPrefixAdded
 		fields["fallback_available"] = details.FallbackAvailable
+		fields["source_item_id_present"] = details.SourceItemIDPresent
+		fields["source_item_id_matches_requested"] = details.SourceItemIDMatchesRequested
+		fields["stream_item_id_present"] = details.StreamItemIDPresent
+		fields["stream_item_id_matches_requested"] = details.StreamItemIDMatchesRequested
 	}
 	if details.FallbackFormatState == "missing" || details.FallbackFormatState == "unsupported" || details.FallbackFormatState == "supported" {
 		fields["fallback_format_state"] = details.FallbackFormatState
+	}
+	if details.TextSubtitleState == "text" || details.TextSubtitleState == "non_text" {
+		fields["text_subtitle_state"] = details.TextSubtitleState
+	}
+	if details.FallbackFormat == "none" || details.FallbackFormat == "vtt" || details.FallbackFormat == "srt" || details.FallbackFormat == "ass" {
+		fields["fallback_format"] = details.FallbackFormat
 	}
 	return embyDiagnosticBaseLogEntry(logger).WithFields(fields)
 }

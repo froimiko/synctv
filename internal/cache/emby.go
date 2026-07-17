@@ -74,17 +74,23 @@ type EmbySource struct {
 }
 
 type EmbySubtitleCache struct {
-	Cache               *refreshcache0.RefreshCache[[]byte]
-	URL                 string
-	Type                string
-	Name                string
-	ContentType         string
-	RouteSource         string
-	DeliveryURLPresent  bool
-	DeliveryURLAccepted bool
-	APIPrefixAdded      bool
-	FallbackAvailable   bool
-	FallbackFormatState string
+	Cache                        *refreshcache0.RefreshCache[[]byte]
+	URL                          string
+	Type                         string
+	Name                         string
+	ContentType                  string
+	RouteSource                  string
+	DeliveryURLPresent           bool
+	DeliveryURLAccepted          bool
+	APIPrefixAdded               bool
+	FallbackAvailable            bool
+	FallbackFormatState          string
+	TextSubtitleState            string
+	FallbackFormat               string
+	SourceItemIDPresent          bool
+	SourceItemIDMatchesRequested bool
+	StreamItemIDPresent          bool
+	StreamItemIDMatchesRequested bool
 }
 
 type EmbyMovieCacheData struct {
@@ -93,27 +99,39 @@ type EmbyMovieCacheData struct {
 }
 
 type EmbyDiagnosticDetails struct {
-	Category            string
-	HTTPStatus          int
-	Timeout             bool
-	SourceCount         int
-	MediaStreamCount    int
-	SubtitleCount       int
-	RouteSource         string
-	DeliveryURLPresent  bool
-	DeliveryURLAccepted bool
-	APIPrefixAdded      bool
-	FallbackAvailable   bool
-	FallbackFormatState string
+	Category                     string
+	HTTPStatus                   int
+	Timeout                      bool
+	SourceCount                  int
+	MediaStreamCount             int
+	SubtitleCount                int
+	RouteSource                  string
+	DeliveryURLPresent           bool
+	DeliveryURLAccepted          bool
+	APIPrefixAdded               bool
+	FallbackAvailable            bool
+	FallbackFormatState          string
+	TextSubtitleState            string
+	FallbackFormat               string
+	SourceItemIDPresent          bool
+	SourceItemIDMatchesRequested bool
+	StreamItemIDPresent          bool
+	StreamItemIDMatchesRequested bool
 }
 
 type embySubtitleRouteDetails struct {
-	RouteSource         string
-	DeliveryURLPresent  bool
-	DeliveryURLAccepted bool
-	APIPrefixAdded      bool
-	FallbackAvailable   bool
-	FallbackFormatState string
+	RouteSource                  string
+	DeliveryURLPresent           bool
+	DeliveryURLAccepted          bool
+	APIPrefixAdded               bool
+	FallbackAvailable            bool
+	FallbackFormatState          string
+	TextSubtitleState            string
+	FallbackFormat               string
+	SourceItemIDPresent          bool
+	SourceItemIDMatchesRequested bool
+	StreamItemIDPresent          bool
+	StreamItemIDMatchesRequested bool
 }
 
 func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
@@ -123,6 +141,12 @@ func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
 	details.APIPrefixAdded = route.APIPrefixAdded
 	details.FallbackAvailable = route.FallbackAvailable
 	details.FallbackFormatState = route.FallbackFormatState
+	details.TextSubtitleState = route.TextSubtitleState
+	details.FallbackFormat = route.FallbackFormat
+	details.SourceItemIDPresent = route.SourceItemIDPresent
+	details.SourceItemIDMatchesRequested = route.SourceItemIDMatchesRequested
+	details.StreamItemIDPresent = route.StreamItemIDPresent
+	details.StreamItemIDMatchesRequested = route.StreamItemIDMatchesRequested
 }
 
 type embyDiagnosticError struct {
@@ -195,12 +219,18 @@ func NewEmbySubtitleDiagnosticError(
 			details.SubtitleCount = subtitleCount
 			if subtitle != nil {
 				embySubtitleRouteDetails{
-					RouteSource:         subtitle.RouteSource,
-					DeliveryURLPresent:  subtitle.DeliveryURLPresent,
-					DeliveryURLAccepted: subtitle.DeliveryURLAccepted,
-					APIPrefixAdded:      subtitle.APIPrefixAdded,
-					FallbackAvailable:   subtitle.FallbackAvailable,
-					FallbackFormatState: subtitle.FallbackFormatState,
+					RouteSource:                  subtitle.RouteSource,
+					DeliveryURLPresent:           subtitle.DeliveryURLPresent,
+					DeliveryURLAccepted:          subtitle.DeliveryURLAccepted,
+					APIPrefixAdded:               subtitle.APIPrefixAdded,
+					FallbackAvailable:            subtitle.FallbackAvailable,
+					FallbackFormatState:          subtitle.FallbackFormatState,
+					TextSubtitleState:            subtitle.TextSubtitleState,
+					FallbackFormat:               subtitle.FallbackFormat,
+					SourceItemIDPresent:          subtitle.SourceItemIDPresent,
+					SourceItemIDMatchesRequested: subtitle.SourceItemIDMatchesRequested,
+					StreamItemIDPresent:          subtitle.StreamItemIDPresent,
+					StreamItemIDMatchesRequested: subtitle.StreamItemIDMatchesRequested,
 				}.apply(details)
 			}
 		},
@@ -738,22 +768,23 @@ func processEmbySubtitles(
 			continue
 		}
 
+		textSubtitleState := "non_text"
+		if msi.GetIsTextSubtitleStream() {
+			textSubtitleState = "text"
+		}
 		subtitleType := ""
 		contentType := ""
 		subtitleURLString := ""
 		route := embySubtitleRouteDetails{
-			RouteSource:         "none",
-			DeliveryURLPresent:  msi.GetDeliveryUrl() != "",
-			FallbackFormatState: embySubtitleFallbackFormatState(msi.GetCodec(), msi.GetMimeType()),
-		}
-		if fallbackType, fallbackContentType, supported := embySubtitleFallbackFormat(msi.GetCodec(), msi.GetMimeType()); supported {
-			if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey, fallbackType); ok {
-				subtitleURLString = fallback.String()
-				subtitleType = fallbackType
-				contentType = fallbackContentType
-				route.RouteSource = "vtt_fallback"
-				route.FallbackAvailable = true
-			}
+			RouteSource:                  "none",
+			DeliveryURLPresent:           msi.GetDeliveryUrl() != "",
+			FallbackFormatState:          embySubtitleFallbackFormatState(msi.GetCodec(), msi.GetMimeType()),
+			TextSubtitleState:            textSubtitleState,
+			FallbackFormat:               "none",
+			SourceItemIDPresent:          v.GetItemIdPresent(),
+			SourceItemIDMatchesRequested: v.GetItemIdMatchesRequested(),
+			StreamItemIDPresent:          msi.GetItemIdPresent(),
+			StreamItemIDMatchesRequested: msi.GetItemIdMatchesRequested(),
 		}
 		if deliveryURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
 			subtitleURLString = deliveryURL.String()
@@ -761,6 +792,17 @@ func processEmbySubtitles(
 			route.RouteSource = "delivery_url"
 			route.DeliveryURLAccepted = true
 			route.APIPrefixAdded = apiPrefixAdded
+		} else if msi.GetIsTextSubtitleStream() {
+			if fallbackType, fallbackContentType, supported := embySubtitleFallbackFormat(msi.GetCodec(), msi.GetMimeType()); supported {
+				if fallback, ok := embySubtitleFallbackURL(base, truePath, v.GetId(), msi.GetIndex(), apiKey, fallbackType); ok {
+					subtitleURLString = fallback.String()
+					subtitleType = fallbackType
+					contentType = fallbackContentType
+					route.RouteSource = "vtt_fallback"
+					route.FallbackAvailable = true
+					route.FallbackFormat = fallbackType
+				}
+			}
 		}
 
 		name := msi.GetDisplayTitle()
@@ -773,16 +815,22 @@ func processEmbySubtitles(
 		}
 
 		subtitles = append(subtitles, &EmbySubtitleCache{
-			URL:                 subtitleURLString,
-			Type:                subtitleType,
-			Name:                name,
-			ContentType:         contentType,
-			RouteSource:         route.RouteSource,
-			DeliveryURLPresent:  route.DeliveryURLPresent,
-			DeliveryURLAccepted: route.DeliveryURLAccepted,
-			APIPrefixAdded:      route.APIPrefixAdded,
-			FallbackAvailable:   route.FallbackAvailable,
-			FallbackFormatState: route.FallbackFormatState,
+			URL:                          subtitleURLString,
+			Type:                         subtitleType,
+			Name:                         name,
+			ContentType:                  contentType,
+			RouteSource:                  route.RouteSource,
+			DeliveryURLPresent:           route.DeliveryURLPresent,
+			DeliveryURLAccepted:          route.DeliveryURLAccepted,
+			APIPrefixAdded:               route.APIPrefixAdded,
+			FallbackAvailable:            route.FallbackAvailable,
+			FallbackFormatState:          route.FallbackFormatState,
+			TextSubtitleState:            route.TextSubtitleState,
+			FallbackFormat:               route.FallbackFormat,
+			SourceItemIDPresent:          route.SourceItemIDPresent,
+			SourceItemIDMatchesRequested: route.SourceItemIDMatchesRequested,
+			StreamItemIDPresent:          route.StreamItemIDPresent,
+			StreamItemIDMatchesRequested: route.StreamItemIDMatchesRequested,
 			Cache: refreshcache0.NewRefreshCache(
 				newEmbySubtitleCacheInitFunc(subtitleURLString, route), -1,
 			),

@@ -789,11 +789,16 @@ func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T)
 		"subtitle_upstream_status",
 		cause,
 		&cache.EmbySubtitleCache{
-			RouteSource:         "delivery_url",
-			DeliveryURLPresent:  true,
-			DeliveryURLAccepted: true,
-			FallbackAvailable:   true,
-			FallbackFormatState: "supported",
+			RouteSource:                  "delivery_url",
+			DeliveryURLPresent:           true,
+			DeliveryURLAccepted:          true,
+			FallbackFormatState:          "supported",
+			TextSubtitleState:            "non_text",
+			FallbackFormat:               "none",
+			SourceItemIDPresent:          true,
+			SourceItemIDMatchesRequested: true,
+			StreamItemIDPresent:          true,
+			StreamItemIDMatchesRequested: false,
 		},
 		1,
 		1,
@@ -811,7 +816,20 @@ func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T)
 	writeEmbyAccessError(ctx, logger.WithField("token", "secret"), err, "failed to load subtitle")
 
 	got := output.String()
-	for _, field := range []string{"category=subtitle_upstream_status", "route_source=delivery_url", "delivery_url_present=true", "delivery_url_accepted=true", "fallback_available=true", "fallback_format_state=supported"} {
+	for _, field := range []string{
+		"category=subtitle_upstream_status",
+		"route_source=delivery_url",
+		"delivery_url_present=true",
+		"delivery_url_accepted=true",
+		"fallback_available=false",
+		"fallback_format_state=supported",
+		"text_subtitle_state=non_text",
+		"fallback_format=none",
+		"source_item_id_present=true",
+		"source_item_id_matches_requested=true",
+		"stream_item_id_present=true",
+		"stream_item_id_matches_requested=false",
+	} {
 		if !strings.Contains(got, field) {
 			t.Fatalf("log missing %q: %q", field, got)
 		}
@@ -847,7 +865,10 @@ func TestEmbyDiagnosticLogEntryOmitsRouteBooleansForInvalidOrEmptySource(t *test
 
 			embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
 			got := output.String()
-			for _, forbidden := range []string{"route_source=", "delivery_url_present=", "delivery_url_accepted=", "api_prefix_added=", "fallback_available="} {
+			for _, forbidden := range []string{
+				"route_source=", "delivery_url_present=", "delivery_url_accepted=", "api_prefix_added=", "fallback_available=",
+				"source_item_id_present=", "source_item_id_matches_requested=", "stream_item_id_present=", "stream_item_id_matches_requested=",
+			} {
 				if strings.Contains(got, forbidden) {
 					t.Fatalf("invalid route source emitted %q: %q", forbidden, got)
 				}
@@ -898,7 +919,7 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 			DeliveryURLPresent:  true,
 			DeliveryURLAccepted: true,
 			APIPrefixAdded:      true,
-			FallbackAvailable:   true,
+			FallbackAvailable:   false,
 			FallbackFormatState: "supported",
 		},
 		1,
@@ -921,7 +942,7 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 		"delivery_url_present=true",
 		"delivery_url_accepted=true",
 		"api_prefix_added=true",
-		"fallback_available=true",
+		"fallback_available=false",
 		"fallback_format_state=supported",
 	} {
 		if !strings.Contains(got, field) {
@@ -931,6 +952,88 @@ func TestEmbyDiagnosticLogEntryUsesOnlySafeFields(t *testing.T) {
 	for _, sensitive := range []string{"private.example", "api_key", secret, "raw-user-id", "raw-room-id", "uid=", "rid=", "token="} {
 		if strings.Contains(got, sensitive) {
 			t.Fatalf("log leaked %q: %q", sensitive, got)
+		}
+	}
+}
+
+func TestEmbyDiagnosticLogEntryAllowsOnlySafeSubtitleEnums(t *testing.T) {
+	tests := []struct {
+		name               string
+		textSubtitleState  string
+		fallbackFormat     string
+		wantTextState      bool
+		wantFallbackFormat bool
+	}{
+		{"valid text and none", "text", "none", true, true},
+		{"valid non-text and VTT", "non_text", "vtt", true, true},
+		{"valid SRT", "text", "srt", true, true},
+		{"valid ASS", "text", "ass", true, true},
+		{"invalid values", "unknown", "subrip", false, false},
+		{"empty values", "", "", false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := log.New()
+			var output strings.Builder
+			logger.SetOutput(&output)
+			logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+			err := cache.NewEmbySubtitleDiagnosticError("subtitle_cache_fetch_failed", nil, &cache.EmbySubtitleCache{
+				RouteSource:       "none",
+				TextSubtitleState: tt.textSubtitleState,
+				FallbackFormat:    tt.fallbackFormat,
+			}, 1, 1)
+
+			embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
+			got := output.String()
+			if strings.Contains(got, "text_subtitle_state=") != tt.wantTextState {
+				t.Fatalf("text subtitle state allowlist mismatch: %q", got)
+			}
+			if strings.Contains(got, "fallback_format=") != tt.wantFallbackFormat {
+				t.Fatalf("fallback format allowlist mismatch: %q", got)
+			}
+		})
+	}
+}
+
+func TestEmbyDiagnosticLogEntryWhitelistsOnlyItemIdentityProofs(t *testing.T) {
+	logger := log.New()
+	var output strings.Builder
+	logger.SetOutput(&output)
+	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+
+	subtitle := &cache.EmbySubtitleCache{
+		RouteSource:                  "none",
+		SourceItemIDPresent:          true,
+		SourceItemIDMatchesRequested: true,
+		StreamItemIDPresent:          true,
+		StreamItemIDMatchesRequested: false,
+	}
+	err := cache.NewEmbySubtitleDiagnosticError("subtitle_cache_fetch_failed", errors.New("sensitive raw IDs"), subtitle, 1, 1)
+	embyDiagnosticLogEntry(logger.WithFields(log.Fields{
+		"item_id":   "raw-item-id",
+		"source_id": "raw-source-id",
+		"stream_id": "raw-stream-id",
+	}), err).Error("emby subtitle request failed")
+
+	got := output.String()
+	for _, field := range []string{
+		"source_item_id_present=true",
+		"source_item_id_matches_requested=true",
+		"stream_item_id_present=true",
+		"stream_item_id_matches_requested=false",
+	} {
+		if !strings.Contains(got, field) {
+			t.Errorf("safe diagnostic log field missing: %s", field)
+		}
+	}
+	for _, forbidden := range []string{
+		"sensitive raw IDs", "raw-item-id", "raw-source-id", "raw-stream-id",
+		"item_id=", "source_id=", "stream_id=", "url=", "host=", "path=", "query=",
+		"codec=", "mime=", "credential=", "cause=",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("diagnostic log exposed a sensitive field class: %s", forbidden)
 		}
 	}
 }

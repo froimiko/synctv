@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -226,6 +227,89 @@ func (c *playbackInfoResultClient) PlaybackInfo(
 	*emby.PlaybackInfoReq,
 ) (*emby.PlaybackInfoResp, error) {
 	return c.response, c.err
+}
+
+type selectedPlaybackInfoClient struct {
+	emby.UnimplementedEmbyServer
+	response        *emby.PlaybackInfoResp
+	request         *emby.PlaybackInfoReq
+	playbackCalls   int
+	cleanupCalls    int
+	cleanupID       string
+	cleanupDeadline time.Time
+}
+
+func (c *selectedPlaybackInfoClient) PlaybackInfo(_ context.Context, req *emby.PlaybackInfoReq) (*emby.PlaybackInfoResp, error) {
+	c.playbackCalls++
+	c.request = req
+	return c.response, nil
+}
+
+func (c *selectedPlaybackInfoClient) DeleteActiveEncodeings(ctx context.Context, req *emby.DeleteActiveEncodeingsReq) (*emby.Empty, error) {
+	c.cleanupCalls++
+	c.cleanupID = req.GetPalySessionId()
+	c.cleanupDeadline, _ = ctx.Deadline()
+	return nil, errors.New("best effort cleanup failure")
+}
+
+func TestGetSelectedPlaybackInfoUsesNonPlaybackAndCleansOnlySelectedSession(t *testing.T) {
+	client := &selectedPlaybackInfoClient{response: &emby.PlaybackInfoResp{
+		PlaySessionID: "selected-session",
+		MediaSourceInfo: []*emby.MediaSourceInfo{{Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{
+			Type: "Subtitle", Index: 7, DeliveryUrl: "/subtitle.vtt",
+		}}}},
+	}}
+	got, err := getSelectedPlaybackInfo(context.Background(), client, &EmbyUserCacheData{Host: "https://emby.example", APIKey: "key", UserID: "user"}, "item", "source", 7)
+	if err != nil || got != "/subtitle.vtt" {
+		t.Fatalf("selected playback info = (%q, %v)", got, err)
+	}
+	if client.request == nil || !client.request.GetNonPlayback() || client.request.SubtitleStreamIndex == nil || *client.request.SubtitleStreamIndex != 7 {
+		t.Fatalf("selected request = %#v", client.request)
+	}
+	if client.cleanupCalls != 1 || client.cleanupID != "selected-session" {
+		t.Fatalf("cleanup = (%d, %q), want selected session exactly once", client.cleanupCalls, client.cleanupID)
+	}
+	remaining := time.Until(client.cleanupDeadline)
+	if remaining < 1500*time.Millisecond || remaining > embySelectedSessionCleanupTimeout {
+		t.Fatalf("cleanup context remaining = %s, want approximately %s", remaining, embySelectedSessionCleanupTimeout)
+	}
+}
+
+func TestGetSelectedPlaybackInfoFailsClosedBeforeRequest(t *testing.T) {
+	client := &selectedPlaybackInfoClient{}
+	_, err := getSelectedPlaybackInfo(context.Background(), client, &EmbyUserCacheData{}, "item", "source", uint64(math.MaxInt32)+1)
+	if EmbyDiagnosticErrorCategory(err) != "subtitle_stream_index_invalid" || client.request != nil {
+		t.Fatalf("overflow result = (%v, %#v)", err, client.request)
+	}
+	client.response = nil
+	_, err = getSelectedPlaybackInfo(context.Background(), client, &EmbyUserCacheData{}, "item", "source", 1)
+	if EmbyDiagnosticErrorCategory(err) != "playback_info_empty" {
+		t.Fatalf("nil response category = %q", EmbyDiagnosticErrorCategory(err))
+	}
+}
+
+func TestLooksLikeEmbySubtitleIsStrict(t *testing.T) {
+	valid := [][]byte{
+		[]byte("\xef\xbb\xbfWEBVTT\n\n00:00.000 --> 00:01.000\ncue\n"),
+		[]byte("1\n00:00:00,000 --> 00:00:01,000\ncue\n"),
+	}
+	for _, body := range valid {
+		if !looksLikeEmbySubtitle(body) {
+			t.Fatalf("rejected valid subtitle %q", body)
+		}
+	}
+	invalid := [][]byte{
+		[]byte("WEBVTT_ERROR"), []byte("WEBVTTx"), []byte("<xml>00:00:00,000 --> 00:00:01,000</xml>"),
+		[]byte("\xef\xbb\xbf{\"cue\":\"00:00:00,000 --> 00:00:01,000\"}"), []byte("00:00:00,000 --> 00:00:01,000"),
+		[]byte("upstream error\n1\n00:00:00,000 --> 00:00:01,000\ncue\n"),
+		[]byte("upstream error\nWEBVTT\n\n00:00.000 --> 00:01.000\ncue\n"),
+		[]byte("\nWEBVTT\n\n00:00.000 --> 00:01.000\ncue\n"),
+	}
+	for _, body := range invalid {
+		if looksLikeEmbySubtitle(body) {
+			t.Fatalf("accepted invalid subtitle %q", body)
+		}
+	}
 }
 
 func TestProcessEmbySubtitlesUsesSafeDeliveryURL(t *testing.T) {
@@ -890,6 +974,173 @@ func TestProcessPlaybackInfoResponseKeepsSubtitleOrderAndRealUpstreamIdentifiers
 	assertCanonicalEmbyAPIKey(t, betaDelivery.Query(), url.Values{"api_key": {testEmbyAPIKey}})
 }
 
+func TestProcessPlaybackInfoResponseDefersSelectionUntilSubtitleGet(t *testing.T) {
+	response := &emby.PlaybackInfoResp{MediaSourceInfo: []*emby.MediaSourceInfo{
+		{Id: "source-a", DirectPlayUrl: "/video-a", MediaStreamInfo: []*emby.MediaStreamInfo{{Type: "Subtitle", Index: 0, Codec: "srt", IsTextSubtitleStream: true}}},
+		{Id: "source-b", DirectPlayUrl: "/video-b", MediaStreamInfo: []*emby.MediaStreamInfo{{Type: "Subtitle", Index: 7, Codec: "srt", IsTextSubtitleStream: true}}},
+	}}
+	var calls []string
+	got, err := processPlaybackInfoResponseWithSelector(response, nil, &EmbyUserCacheData{
+		Host: "https://emby.example", APIKey: testEmbyAPIKey,
+	}, "item", func(source *emby.MediaSourceInfo, stream *emby.MediaStreamInfo, _ embySubtitleRouteDetails) func(context.Context) ([]byte, error) {
+		return func(context.Context) ([]byte, error) {
+			calls = append(calls, source.GetId()+":"+strconv.FormatUint(stream.GetIndex(), 10))
+			return []byte("WEBVTT\n\n00:00.000 --> 00:01.000\nlazy\n"), nil
+		}
+	})
+	if err != nil {
+		t.Fatalf("process playback info: %v", err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("selection happened during movie cache build: %#v", calls)
+	}
+	selected := got.Sources[1].Subtitles[0]
+	for i := 0; i < 2; i++ {
+		if _, err := selected.Cache.Get(context.Background()); err != nil {
+			t.Fatalf("lazy subtitle get %d: %v", i, err)
+		}
+	}
+	if len(calls) != 1 || calls[0] != "source-b:7" {
+		t.Fatalf("selection calls = %#v, want one source-b:7", calls)
+	}
+}
+
+func TestLazyEmbySubtitleSelectedDeliveryURLUsesStrictFetch(t *testing.T) {
+	const secret = "selected-secret"
+	tests := []struct {
+		name         string
+		contentType  string
+		body         string
+		status       int
+		wantCategory string
+	}{
+		{"HTML", "text/html", "<html>secret</html>", http.StatusOK, "subtitle_invalid_body"},
+		{"JSON", "application/json", `{"error":"secret"}`, http.StatusOK, "subtitle_invalid_body"},
+		{"empty", "text/vtt", "", http.StatusOK, "subtitle_invalid_body"},
+		{"plain text", "text/plain", "upstream error", http.StatusOK, "subtitle_invalid_body"},
+		{"SRT", "application/x-subrip", "1\n00:00:00,000 --> 00:00:01,000\nselected SRT\n", http.StatusOK, ""},
+		{"VTT", "text/vtt", "WEBVTT\n\n00:00.000 --> 00:01.000\nselected VTT\n", http.StatusOK, ""},
+		{"404", "text/plain", "not found secret", http.StatusNotFound, "subtitle_upstream_status"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(embySubtitleProbeEnv, "1")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			client := &selectedPlaybackInfoClient{response: &emby.PlaybackInfoResp{MediaSourceInfo: []*emby.MediaSourceInfo{{
+				Id: "source", MediaStreamInfo: []*emby.MediaStreamInfo{{Type: "Subtitle", Index: 7, DeliveryUrl: "/selected"}},
+			}}}}
+			init := newLazyEmbySubtitleCacheInitFunc(client, &EmbyUserCacheData{Host: server.URL, APIKey: secret}, "item",
+				&emby.MediaSourceInfo{Id: "source"}, &emby.MediaStreamInfo{Type: "Subtitle", Index: 7, Codec: "vtt"}, mustTestURL(t, server.URL),
+				embySubtitleRouteDetails{RouteSource: "vtt_fallback", FallbackAvailable: true})
+			data, err := init(context.Background())
+			if tt.wantCategory == "" {
+				if err != nil || string(data) != tt.body {
+					t.Fatalf("selected fetch = (%q, %v), want body", data, err)
+				}
+				return
+			}
+			details, ok := EmbyDiagnosticDetailsFromError(err)
+			if !ok || details.Category != tt.wantCategory || details.SelectionState != "selected_delivery_url" ||
+				details.RouteSource != "delivery_url" || !details.SelectedDeliveryURLAccepted {
+				t.Fatalf("selected diagnostics = %#v, ok=%v", details, ok)
+			}
+			if tt.status == http.StatusNotFound && details.HTTPStatus != http.StatusNotFound {
+				t.Fatalf("HTTP status = %d, want 404", details.HTTPStatus)
+			}
+			assertRedactedSubtitleError(t, err, []string{server.URL, "selected", "api_key", secret, tt.body})
+		})
+	}
+}
+
+func TestLazyEmbySubtitleProbeDisabledDoesNotCallSelectedPlayback(t *testing.T) {
+	t.Setenv(embySubtitleProbeEnv, "0")
+	const body = "WEBVTT\n\n00:00.000 --> 00:01.000\nfallback\n"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) }))
+	defer server.Close()
+	client := &selectedPlaybackInfoClient{}
+	init := newLazyEmbySubtitleCacheInitFunc(client, &EmbyUserCacheData{Host: server.URL, APIKey: testEmbyAPIKey}, "item",
+		&emby.MediaSourceInfo{Id: "source"}, &emby.MediaStreamInfo{Type: "Subtitle", Index: 7, Codec: "vtt"}, mustTestURL(t, server.URL), embySubtitleRouteDetails{})
+	data, err := init(context.Background())
+	if err != nil || string(data) != body || client.playbackCalls != 0 {
+		t.Fatalf("probe-disabled fetch = (%q, %v), selected calls=%d", data, err, client.playbackCalls)
+	}
+}
+
+func TestNewEmbySubtitleProbeDiagnosticErrorPreservesRouteAndLastMeaningfulFailure(t *testing.T) {
+	const secret = "probe-secret"
+	route := embySubtitleRouteDetails{
+		RouteSource:                  "vtt_fallback",
+		SelectionState:               "selected_error",
+		DeliveryURLPresent:           false,
+		DeliveryURLAccepted:          false,
+		SelectedDeliveryURLAccepted:  false,
+		FallbackAvailable:            true,
+		SourceItemIDPresent:          true,
+		SourceItemIDMatchesRequested: true,
+		StreamItemIDPresent:          true,
+		StreamItemIDMatchesRequested: false,
+	}
+	cause := errors.New("https://private.example/subtitle?api_key=" + secret)
+	fetchErr := newEmbyDiagnosticErrorWithDetails(
+		"subtitle_upstream_status", "emby media request failed", cause,
+		func(details *EmbyDiagnosticDetails) { details.HTTPStatus = http.StatusBadGateway },
+	)
+	err := newEmbySubtitleProbeDiagnosticError(context.Background(), route, fetchErr, nil)
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok || details.Category != "subtitle_upstream_status" || details.HTTPStatus != http.StatusBadGateway ||
+		details.SelectionState != "selected_error" || details.RouteSource != "vtt_fallback" || !details.FallbackAvailable ||
+		!details.SourceItemIDPresent || !details.SourceItemIDMatchesRequested || !details.StreamItemIDPresent || details.StreamItemIDMatchesRequested {
+		t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatal("wrapped probe error did not preserve fetch cause")
+	}
+	assertRedactedSubtitleError(t, err, []string{"private.example", "api_key", secret})
+}
+
+func TestNewEmbySubtitleProbeDiagnosticErrorCoversSelectionRoutes(t *testing.T) {
+	tests := []struct {
+		name  string
+		route embySubtitleRouteDetails
+	}{
+		{"selected no delivery", embySubtitleRouteDetails{RouteSource: "vtt_fallback", SelectionState: "selected_no_delivery", FallbackAvailable: true}},
+		{"unsafe selected URL", embySubtitleRouteDetails{RouteSource: "vtt_fallback", SelectionState: "selected_delivery_url", SelectedDeliveryURLAccepted: false, FallbackAvailable: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := newEmbySubtitleProbeDiagnosticError(context.Background(), tt.route, NewEmbyDiagnosticError("subtitle_invalid_body", nil), nil)
+			details, ok := EmbyDiagnosticDetailsFromError(err)
+			if !ok || details.Category != "subtitle_invalid_body" || details.SelectionState != tt.route.SelectionState ||
+				details.RouteSource != tt.route.RouteSource || details.SelectedDeliveryURLAccepted || !details.FallbackAvailable {
+				t.Fatalf("diagnostic details = %#v, ok = %v", details, ok)
+			}
+		})
+	}
+}
+
+func TestNewEmbySubtitleProbeDiagnosticErrorPrefersTotalBudgetTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(context.DeadlineExceeded)
+	err := newEmbySubtitleProbeDiagnosticError(ctx, embySubtitleRouteDetails{
+		RouteSource: "vtt_fallback", SelectionState: "selected_no_delivery", FallbackAvailable: true,
+	}, newEmbyDiagnosticErrorWithDetails("subtitle_upstream_status", "failed", nil, func(details *EmbyDiagnosticDetails) {
+		details.HTTPStatus = http.StatusBadGateway
+	}), context.DeadlineExceeded)
+	details, ok := EmbyDiagnosticDetailsFromError(err)
+	if !ok || details.Category != "subtitle_upstream_timeout" || !details.Timeout || details.HTTPStatus != 0 ||
+		details.SelectionState != "selected_no_delivery" || details.RouteSource != "vtt_fallback" || !details.FallbackAvailable {
+		t.Fatalf("timeout details = %#v, ok = %v", details, ok)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("timeout diagnostic did not preserve context cause")
+	}
+}
+
 func TestNewEmbySubtitleCacheInitFuncFetchesBody(t *testing.T) {
 	const body = "WEBVTT\n\n00:00.000 --> 00:01.000\nsubtitle\n"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1090,7 +1341,7 @@ func assertRedactedSubtitleError(t *testing.T, err error, sensitive []string) {
 		t.Fatal("expected subtitle error")
 	}
 	for _, value := range sensitive {
-		if strings.Contains(err.Error(), value) {
+		if value != "" && strings.Contains(err.Error(), value) {
 			t.Fatalf("error leaked %q: %q", value, err)
 		}
 	}

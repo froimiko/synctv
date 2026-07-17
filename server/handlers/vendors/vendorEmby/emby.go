@@ -69,12 +69,17 @@ func embyDiagnosticLogEntry(logger *log.Entry, err error) *log.Entry {
 		fields["route_source"] = details.RouteSource
 		fields["delivery_url_present"] = details.DeliveryURLPresent
 		fields["delivery_url_accepted"] = details.DeliveryURLAccepted
+		fields["selected_delivery_url_accepted"] = details.SelectedDeliveryURLAccepted
 		fields["api_prefix_added"] = details.APIPrefixAdded
 		fields["fallback_available"] = details.FallbackAvailable
 		fields["source_item_id_present"] = details.SourceItemIDPresent
 		fields["source_item_id_matches_requested"] = details.SourceItemIDMatchesRequested
 		fields["stream_item_id_present"] = details.StreamItemIDPresent
 		fields["stream_item_id_matches_requested"] = details.StreamItemIDMatchesRequested
+	}
+	if details.SelectionState == "selected_skipped" || details.SelectionState == "selected_no_delivery" ||
+		details.SelectionState == "selected_error" || details.SelectionState == "selected_delivery_url" {
+		fields["selection_state"] = details.SelectionState
 	}
 	if details.FallbackFormatState == "missing" || details.FallbackFormatState == "unsupported" || details.FallbackFormatState == "supported" {
 		fields["fallback_format_state"] = details.FallbackFormatState

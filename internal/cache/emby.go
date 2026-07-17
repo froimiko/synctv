@@ -1,14 +1,18 @@
 package cache
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -80,8 +84,10 @@ type EmbySubtitleCache struct {
 	Name                         string
 	ContentType                  string
 	RouteSource                  string
+	SelectionState               string
 	DeliveryURLPresent           bool
 	DeliveryURLAccepted          bool
+	SelectedDeliveryURLAccepted  bool
 	APIPrefixAdded               bool
 	FallbackAvailable            bool
 	FallbackFormatState          string
@@ -106,8 +112,10 @@ type EmbyDiagnosticDetails struct {
 	MediaStreamCount             int
 	SubtitleCount                int
 	RouteSource                  string
+	SelectionState               string
 	DeliveryURLPresent           bool
 	DeliveryURLAccepted          bool
+	SelectedDeliveryURLAccepted  bool
 	APIPrefixAdded               bool
 	FallbackAvailable            bool
 	FallbackFormatState          string
@@ -121,8 +129,10 @@ type EmbyDiagnosticDetails struct {
 
 type embySubtitleRouteDetails struct {
 	RouteSource                  string
+	SelectionState               string
 	DeliveryURLPresent           bool
 	DeliveryURLAccepted          bool
+	SelectedDeliveryURLAccepted  bool
 	APIPrefixAdded               bool
 	FallbackAvailable            bool
 	FallbackFormatState          string
@@ -136,8 +146,10 @@ type embySubtitleRouteDetails struct {
 
 func (route embySubtitleRouteDetails) apply(details *EmbyDiagnosticDetails) {
 	details.RouteSource = route.RouteSource
+	details.SelectionState = route.SelectionState
 	details.DeliveryURLPresent = route.DeliveryURLPresent
 	details.DeliveryURLAccepted = route.DeliveryURLAccepted
+	details.SelectedDeliveryURLAccepted = route.SelectedDeliveryURLAccepted
 	details.APIPrefixAdded = route.APIPrefixAdded
 	details.FallbackAvailable = route.FallbackAvailable
 	details.FallbackFormatState = route.FallbackFormatState
@@ -220,8 +232,10 @@ func NewEmbySubtitleDiagnosticError(
 			if subtitle != nil {
 				embySubtitleRouteDetails{
 					RouteSource:                  subtitle.RouteSource,
+					SelectionState:               subtitle.SelectionState,
 					DeliveryURLPresent:           subtitle.DeliveryURLPresent,
 					DeliveryURLAccepted:          subtitle.DeliveryURLAccepted,
+					SelectedDeliveryURLAccepted:  subtitle.SelectedDeliveryURLAccepted,
 					APIPrefixAdded:               subtitle.APIPrefixAdded,
 					FallbackAvailable:            subtitle.FallbackAvailable,
 					FallbackFormatState:          subtitle.FallbackFormatState,
@@ -416,7 +430,9 @@ func newEmbyMovieCacheInitFunc(
 			return nil, err
 		}
 
-		return processPlaybackInfoResponse(data, movie, aucd, requestedItemID)
+		return processPlaybackInfoResponseWithSelector(data, movie, aucd, requestedItemID, func(source *emby.MediaSourceInfo, stream *emby.MediaStreamInfo, route embySubtitleRouteDetails) func(context.Context) ([]byte, error) {
+			return newLazyEmbySubtitleCacheInitFunc(cli, aucd, requestedItemID, source, stream, uFromHost(aucd.Host), route)
+		})
 	}
 }
 
@@ -457,6 +473,16 @@ func processPlaybackInfoResponse(
 	aucd *EmbyUserCacheData,
 	requestedItemID string,
 ) (*EmbyMovieCacheData, error) {
+	return processPlaybackInfoResponseWithSelector(data, movie, aucd, requestedItemID, nil)
+}
+
+func processPlaybackInfoResponseWithSelector(
+	data *emby.PlaybackInfoResp,
+	movie *model.Movie,
+	aucd *EmbyUserCacheData,
+	requestedItemID string,
+	lazyInit func(*emby.MediaSourceInfo, *emby.MediaStreamInfo, embySubtitleRouteDetails) func(context.Context) ([]byte, error),
+) (*EmbyMovieCacheData, error) {
 	if data == nil {
 		return nil, newEmbyDiagnosticError("playback_info_empty", "playback info response is empty", nil)
 	}
@@ -495,7 +521,7 @@ func processPlaybackInfoResponse(
 
 		validSourceCount++
 		resp.Sources[i] = *source
-		resp.Sources[i].Subtitles = processEmbySubtitles(v, requestedItemID, aucd.APIKey, u)
+		resp.Sources[i].Subtitles = processEmbySubtitles(v, requestedItemID, aucd.APIKey, u, lazyInit)
 	}
 	if validSourceCount == 0 {
 		return nil, newEmbyMediaSourceProcessingError("failed to process media sources", nil, mediaSources)
@@ -571,6 +597,54 @@ func getPlaybackInfo(
 		return nil, newEmbyDiagnosticError("playback_info_failed", "playback info request failed", err)
 	}
 	return data, nil
+}
+
+func getSelectedPlaybackInfo(
+	ctx context.Context,
+	cli emby.EmbyHTTPServer,
+	aucd *EmbyUserCacheData,
+	itemID, sourceID string,
+	streamIndex uint64,
+) (string, error) {
+	if streamIndex > math.MaxInt32 {
+		return "", newEmbyDiagnosticError("subtitle_stream_index_invalid", "subtitle stream index is invalid", nil)
+	}
+	index := int32(streamIndex)
+	data, err := cli.PlaybackInfo(ctx, &emby.PlaybackInfoReq{
+		Host: aucd.Host, Token: aucd.APIKey, UserId: aucd.UserID, ItemId: itemID,
+		MediaSourceId: sourceID, SubtitleStreamIndex: &index, NonPlayback: true,
+	})
+	if err != nil {
+		return "", newEmbyDiagnosticError("playback_info_failed", "selected playback info request failed", err)
+	}
+	if data == nil {
+		return "", newEmbyDiagnosticError("playback_info_empty", "selected playback info response is empty", nil)
+	}
+
+	selectedDeliveryURL := ""
+	for _, source := range data.GetMediaSourceInfo() {
+		if source == nil || source.GetId() != sourceID {
+			continue
+		}
+		for _, stream := range source.GetMediaStreamInfo() {
+			if stream != nil && stream.GetType() == "Subtitle" && stream.GetIndex() == streamIndex {
+				selectedDeliveryURL = stream.GetDeliveryUrl()
+				break
+			}
+		}
+	}
+
+	if sessionID := data.GetPlaySessionID(); sessionID != "" {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), embySelectedSessionCleanupTimeout)
+		_, cleanupErr := cli.DeleteActiveEncodeings(cleanupCtx, &emby.DeleteActiveEncodeingsReq{
+			Host: aucd.Host, Token: aucd.APIKey, PalySessionId: sessionID,
+		})
+		cleanupCancel()
+		if cleanupErr != nil {
+			log.Warn("failed to clean selected playback info session")
+		}
+	}
+	return selectedDeliveryURL, nil
 }
 
 func processMediaSource(
@@ -757,7 +831,12 @@ func processEmbySubtitles(
 	truePath string,
 	apiKey string,
 	base *url.URL,
+	lazyInitializers ...func(*emby.MediaSourceInfo, *emby.MediaStreamInfo, embySubtitleRouteDetails) func(context.Context) ([]byte, error),
 ) []*EmbySubtitleCache {
+	var lazyInit func(*emby.MediaSourceInfo, *emby.MediaStreamInfo, embySubtitleRouteDetails) func(context.Context) ([]byte, error)
+	if len(lazyInitializers) != 0 {
+		lazyInit = lazyInitializers[0]
+	}
 	if v == nil {
 		return nil
 	}
@@ -786,7 +865,8 @@ func processEmbySubtitles(
 			StreamItemIDPresent:          msi.GetItemIdPresent(),
 			StreamItemIDMatchesRequested: msi.GetItemIdMatchesRequested(),
 		}
-		if deliveryURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, msi.GetDeliveryUrl(), apiKey); ok {
+		rawDeliveryURL := msi.GetDeliveryUrl()
+		if deliveryURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, rawDeliveryURL, apiKey); ok {
 			subtitleURLString = deliveryURL.String()
 			subtitleType, contentType = embySubtitleFormat(deliveryURL, msi.GetCodec(), msi.GetMimeType())
 			route.RouteSource = "delivery_url"
@@ -814,14 +894,22 @@ func processEmbySubtitles(
 			}
 		}
 
+		initFunc := newEmbySubtitleCacheInitFunc(subtitleURLString, route)
+		if rawDeliveryURL == "" && lazyInit != nil {
+			initFunc = lazyInit(v, msi, route)
+		} else {
+			route.SelectionState = "selected_skipped"
+		}
 		subtitles = append(subtitles, &EmbySubtitleCache{
 			URL:                          subtitleURLString,
 			Type:                         subtitleType,
 			Name:                         name,
 			ContentType:                  contentType,
 			RouteSource:                  route.RouteSource,
+			SelectionState:               route.SelectionState,
 			DeliveryURLPresent:           route.DeliveryURLPresent,
 			DeliveryURLAccepted:          route.DeliveryURLAccepted,
+			SelectedDeliveryURLAccepted:  route.SelectedDeliveryURLAccepted,
 			APIPrefixAdded:               route.APIPrefixAdded,
 			FallbackAvailable:            route.FallbackAvailable,
 			FallbackFormatState:          route.FallbackFormatState,
@@ -831,13 +919,169 @@ func processEmbySubtitles(
 			SourceItemIDMatchesRequested: route.SourceItemIDMatchesRequested,
 			StreamItemIDPresent:          route.StreamItemIDPresent,
 			StreamItemIDMatchesRequested: route.StreamItemIDMatchesRequested,
-			Cache: refreshcache0.NewRefreshCache(
-				newEmbySubtitleCacheInitFunc(subtitleURLString, route), -1,
-			),
+			Cache:                        refreshcache0.NewRefreshCache(initFunc, -1),
 		})
 	}
 
 	return subtitles
+}
+
+const (
+	embySubtitleProbeEnv              = "SYNCTV_EMBY_SUBTITLE_PROBE"
+	embySelectedSessionCleanupTimeout = 2 * time.Second
+)
+
+var (
+	embySRTCue      = regexp.MustCompile(`(?s)^(?:\d+[ \t]*\r?\n)?[ \t]*\d{1,2}:\d{2}:\d{2},\d{3}[ \t]+-->[ \t]+\d{1,2}:\d{2}:\d{2},\d{3}[^\r\n]*\r?\n[^\r\n]+(?:\r?\n|$)`)
+	embyMarkupStart = regexp.MustCompile(`(?is)^\s*<\??[a-z!/]`)
+)
+
+func uFromHost(host string) *url.URL {
+	u, _ := url.Parse(host)
+	return u
+}
+
+func stripUTF8BOM(data []byte) []byte {
+	return bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
+}
+
+func looksLikeEmbySubtitle(data []byte) bool {
+	body := stripUTF8BOM(data)
+	if len(body) == 0 {
+		return false
+	}
+
+	firstLine := body
+	if newline := bytes.IndexByte(firstLine, '\n'); newline >= 0 {
+		firstLine = firstLine[:newline]
+	}
+	firstLine = bytes.TrimSuffix(firstLine, []byte{'\r'})
+	if bytes.Equal(bytes.ToUpper(firstLine), []byte("WEBVTT")) {
+		return true
+	}
+
+	return embySRTCue.Match(body)
+}
+
+func embySubtitleContentTypeClass(value string) string {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil || mediaType == "" {
+		return "unknown"
+	}
+	switch {
+	case strings.Contains(mediaType, "html") || strings.Contains(mediaType, "xml"):
+		return "markup"
+	case strings.Contains(mediaType, "json"):
+		return "json"
+	case strings.HasPrefix(mediaType, "text/") || strings.Contains(mediaType, "subrip"):
+		return "text"
+	default:
+		return "other"
+	}
+}
+
+func embySubtitleBodyClass(data []byte) string {
+	trimmed := bytes.TrimSpace(stripUTF8BOM(data))
+	lower := bytes.ToLower(trimmed)
+	switch {
+	case len(trimmed) == 0:
+		return "empty"
+	case embyMarkupStart.Match(trimmed):
+		return "markup"
+	case trimmed[0] == '{' || trimmed[0] == '[' || bytes.HasPrefix(lower, []byte(")]}'")) || bytes.HasPrefix(lower, []byte("while(1);")) || bytes.HasPrefix(lower, []byte("for(;;);")):
+		return "json"
+	case looksLikeEmbySubtitle(trimmed):
+		return "subtitle"
+	default:
+		return "other"
+	}
+}
+
+type embySubtitleProbeCandidate struct {
+	name string
+	url  string
+}
+
+func newLazyEmbySubtitleCacheInitFunc(cli emby.EmbyHTTPServer, aucd *EmbyUserCacheData, itemID string, source *emby.MediaSourceInfo, stream *emby.MediaStreamInfo, base *url.URL, route embySubtitleRouteDetails) func(context.Context) ([]byte, error) {
+	return func(ctx context.Context) ([]byte, error) {
+		format, _, supported := embySubtitleFallbackFormat(stream.GetCodec(), stream.GetMimeType())
+		if !supported {
+			route.SelectionState = "selected_skipped"
+			return nil, newEmbyDiagnosticErrorWithDetails("subtitle_cache_fetch_failed", "subtitle cache fetch failed", nil, route.apply)
+		}
+		primary, _ := embySubtitleFallbackURL(base, itemID, source.GetId(), stream.GetIndex(), aucd.APIKey, format)
+		if os.Getenv(embySubtitleProbeEnv) != "1" || format == "ass" {
+			route.SelectionState = "selected_skipped"
+			return newEmbySubtitleCacheInitFunc(primary.String(), route)(ctx)
+		}
+
+		probeCtx, cancel := context.WithTimeout(ctx, embySubtitleHTTPTimeout)
+		defer cancel()
+		client := newEmbySubtitleHTTPClient()
+		client.Timeout = 0 // The shared probe context owns the total 30-second budget.
+		selected, selectionErr := getSelectedPlaybackInfo(probeCtx, cli, aucd, itemID, source.GetId(), stream.GetIndex())
+		route.SelectionState = "selected_no_delivery"
+		if selectionErr != nil {
+			route.SelectionState = "selected_error"
+		} else if selected != "" {
+			route.SelectionState = "selected_delivery_url"
+		}
+		log.WithField("selection_state", route.SelectionState).Info("emby subtitle selected playback info")
+		if selectedURL, ok, apiPrefixAdded := embySubtitleDeliveryURL(base, selected, aucd.APIKey); ok {
+			route.RouteSource = "delivery_url"
+			route.SelectedDeliveryURLAccepted = true
+			route.APIPrefixAdded = apiPrefixAdded
+			data, _, _, _, fetchErr := fetchEmbySubtitleCandidate(probeCtx, client, selectedURL.String())
+			if fetchErr != nil {
+				return nil, newEmbySubtitleProbeDiagnosticError(probeCtx, route, fetchErr, nil)
+			}
+			return data, nil
+		}
+		if probeCtx.Err() != nil {
+			return nil, newEmbyDiagnosticErrorWithDetails("subtitle_upstream_timeout", "emby media request failed", probeCtx.Err(), route.apply)
+		}
+
+		makeURL := func(withSource bool, extension string) string {
+			parts := []string{"/emby", "Videos", itemID}
+			if withSource {
+				parts = append(parts, source.GetId())
+			}
+			parts = append(parts, "Subtitles", strconv.FormatUint(stream.GetIndex(), 10), "Stream."+extension)
+			u := *base
+			u.Path = path.Join(parts...)
+			u.RawQuery = ""
+			setCanonicalEmbyAPIKey(&u, url.Values{}, aucd.APIKey)
+			return u.String()
+		}
+		rawCandidates := []embySubtitleProbeCandidate{
+			{"with_source_original", makeURL(true, format)},
+			{"with_source_vtt", makeURL(true, "vtt")},
+			{"without_source_original", makeURL(false, format)},
+			{"without_source_vtt", makeURL(false, "vtt")},
+		}
+		candidates := make([]embySubtitleProbeCandidate, 0, len(rawCandidates))
+		seen := make(map[string]struct{}, len(rawCandidates))
+		for _, candidate := range rawCandidates {
+			if _, exists := seen[candidate.url]; exists {
+				continue
+			}
+			seen[candidate.url] = struct{}{}
+			candidates = append(candidates, candidate)
+		}
+		var lastErr error
+		for _, candidate := range candidates {
+			if err := probeCtx.Err(); err != nil {
+				return nil, newEmbySubtitleProbeDiagnosticError(probeCtx, route, lastErr, err)
+			}
+			data, status, contentClass, bodyClass, fetchErr := fetchEmbySubtitleCandidate(probeCtx, client, candidate.url)
+			log.WithFields(log.Fields{"candidate": candidate.name, "status": status, "content_type_class": contentClass, "body_class": bodyClass}).Info("emby subtitle probe")
+			if fetchErr == nil {
+				return data, nil
+			}
+			lastErr = fetchErr
+		}
+		return nil, newEmbySubtitleProbeDiagnosticError(probeCtx, route, lastErr, nil)
+	}
 }
 
 const embySubtitleHTTPTimeout = 30 * time.Second
@@ -850,6 +1094,76 @@ func newEmbySubtitleHTTPClient() *http.Client {
 			return http.ErrUseLastResponse
 		},
 	}
+}
+
+func newEmbySubtitleProbeDiagnosticError(ctx context.Context, route embySubtitleRouteDetails, fetchErr, contextErr error) error {
+	if contextErr == nil && ctx != nil {
+		contextErr = ctx.Err()
+	}
+	if errors.Is(contextErr, context.DeadlineExceeded) {
+		return newEmbyDiagnosticErrorWithDetails(
+			"subtitle_upstream_timeout", "emby media request failed", contextErr,
+			func(details *EmbyDiagnosticDetails) {
+				route.apply(details)
+				details.Timeout = true
+			},
+		)
+	}
+	if fetchErr == nil {
+		fetchErr = contextErr
+	}
+	if details, ok := EmbyDiagnosticDetailsFromError(fetchErr); ok {
+		return newEmbyDiagnosticErrorWithDetails(
+			details.Category, "emby media request failed", fetchErr,
+			func(wrapped *EmbyDiagnosticDetails) {
+				route.apply(wrapped)
+				wrapped.HTTPStatus = details.HTTPStatus
+				wrapped.Timeout = details.Timeout
+			},
+		)
+	}
+	return newEmbyDiagnosticErrorWithDetails(
+		"subtitle_upstream_request_failed", "emby media request failed", fetchErr, route.apply,
+	)
+}
+
+func fetchEmbySubtitleCandidate(ctx context.Context, client *http.Client, rawURL string) ([]byte, int, string, string, error) {
+	if client == nil {
+		client = newEmbySubtitleHTTPClient()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, 0, "unknown", "unread", NewEmbyDiagnosticError("subtitle_upstream_request_failed", err)
+	}
+	req.Header.Set("User-Agent", utils.UA)
+	req.Header.Set("Referer", req.URL.Scheme+"://"+req.URL.Host)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, "unknown", "unread", NewEmbyDiagnosticError("subtitle_upstream_request_failed", err)
+	}
+	defer resp.Body.Close()
+	contentClass := embySubtitleContentTypeClass(resp.Header.Get("Content-Type"))
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, contentClass, "unread", newEmbyDiagnosticErrorWithDetails(
+			"subtitle_upstream_status", "emby media request failed", nil,
+			func(details *EmbyDiagnosticDetails) { details.HTTPStatus = resp.StatusCode },
+		)
+	}
+	if resp.ContentLength > subtitleMaxLength {
+		return nil, resp.StatusCode, contentClass, "too_large", NewEmbyDiagnosticError("subtitle_response_too_large", nil)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, subtitleMaxLength+1))
+	if err != nil {
+		return nil, resp.StatusCode, contentClass, "unread", NewEmbyDiagnosticError("subtitle_upstream_read_failed", err)
+	}
+	if len(data) > subtitleMaxLength {
+		return nil, resp.StatusCode, contentClass, "too_large", NewEmbyDiagnosticError("subtitle_response_too_large", nil)
+	}
+	bodyClass := embySubtitleBodyClass(data)
+	if contentClass == "markup" || contentClass == "json" || bodyClass != "subtitle" {
+		return nil, resp.StatusCode, contentClass, bodyClass, NewEmbyDiagnosticError("subtitle_invalid_body", nil)
+	}
+	return data, resp.StatusCode, contentClass, bodyClass, nil
 }
 
 func newEmbySubtitleCacheInitFunc(rawURL string, routes ...embySubtitleRouteDetails) func(ctx context.Context) ([]byte, error) {

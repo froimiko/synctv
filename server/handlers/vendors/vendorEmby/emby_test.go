@@ -851,6 +851,27 @@ func TestSubtitleUpstream404DetailsDriveIsolatedLogAndFixedHTTP500(t *testing.T)
 	}
 }
 
+func TestEmbyDiagnosticLogEntryIncludesSelectionStateOnFinalFailure(t *testing.T) {
+	logger := log.New()
+	var output strings.Builder
+	logger.SetOutput(&output)
+	logger.SetFormatter(&log.TextFormatter{DisableTimestamp: true, DisableQuote: true})
+	err := cache.NewEmbySubtitleDiagnosticError("subtitle_invalid_body", errors.New("secret cause"), &cache.EmbySubtitleCache{
+		RouteSource: "vtt_fallback", SelectionState: "selected_error", FallbackAvailable: true,
+	}, 1, 1)
+
+	embyDiagnosticLogEntry(log.NewEntry(logger), err).Error("emby subtitle request failed")
+	got := output.String()
+	for _, field := range []string{"category=subtitle_invalid_body", "route_source=vtt_fallback", "selection_state=selected_error", "fallback_available=true"} {
+		if !strings.Contains(got, field) {
+			t.Fatalf("log missing %q: %q", field, got)
+		}
+	}
+	if strings.Contains(got, "secret cause") || strings.Contains(got, "cause=") {
+		t.Fatalf("log leaked cause: %q", got)
+	}
+}
+
 func TestEmbyDiagnosticLogEntryOmitsRouteBooleansForInvalidOrEmptySource(t *testing.T) {
 	for _, routeSource := range []string{"", "invalid"} {
 		t.Run(routeSource, func(t *testing.T) {

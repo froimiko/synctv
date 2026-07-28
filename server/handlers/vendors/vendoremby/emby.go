@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -689,29 +690,53 @@ func (s *EmbyVendorService) GenMovieInfo(
 	}
 
 	movie := s.movie.Clone()
-	movie.Subtitles = nil
-
 	data, err := s.embyMovieCacheData(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	return rebuildEmbyDirectMovie(movie, data.Sources, userToken)
+}
+
+func rebuildEmbyDirectMovie(
+	movie *dbModel.Movie,
+	sources []cache.EmbySource,
+	userToken string,
+) (*dbModel.Movie, error) {
+	if movie == nil {
+		return nil, errors.New("movie is required")
+	}
+
+	movie.URL = ""
+	movie.Type = ""
+	movie.SourceKey = ""
+	movie.IsTranscode = false
+	movie.MoreSources = nil
+	movie.Headers = nil
+	movie.Subtitles = nil
+
 	hasSource := false
-	for sourceIndex, source := range data.Sources {
+	for sourceIndex, source := range sources {
 		if source.URL == "" {
 			continue
 		}
 
+		sourceType := embySourceType(source)
+		sourceKey := embySourceKey(source, sourceIndex)
 		if !hasSource {
 			movie.URL = source.URL
+			movie.Type = sourceType
+			movie.SourceKey = sourceKey
+			movie.IsTranscode = source.IsTranscode
 			hasSource = true
 		} else {
-			movie.MoreSources = append(movie.MoreSources,
-				&dbModel.MoreSource{
-					Name: source.Name,
-					URL:  source.URL,
-				},
-			)
+			movie.MoreSources = append(movie.MoreSources, &dbModel.MoreSource{
+				Name:        source.Name,
+				URL:         source.URL,
+				Type:        sourceType,
+				SourceKey:   sourceKey,
+				IsTranscode: source.IsTranscode,
+			})
 		}
 
 		if err := addEmbySourceSubtitles(movie, source, userToken, sourceIndex); err != nil {
@@ -726,6 +751,23 @@ func (s *EmbyVendorService) GenMovieInfo(
 	return movie, nil
 }
 
+func embySourceKey(source cache.EmbySource, sourceIndex int) string {
+	if source.ID != "" {
+		return source.ID
+	}
+	return fmt.Sprintf("emby-source:%d", sourceIndex)
+}
+
+func embySourceType(source cache.EmbySource) string {
+	if extension := strings.ToLower(utils.GetURLExtension(source.URL)); extension != "" {
+		return extension
+	}
+	if source.IsTranscode {
+		return ""
+	}
+	return strings.ToLower(source.Container)
+}
+
 func rebuildEmbyProxyMovie(
 	movie *dbModel.Movie,
 	sources []cache.EmbySource,
@@ -736,6 +778,9 @@ func rebuildEmbyProxyMovie(
 	}
 
 	movie.URL = ""
+	movie.Type = ""
+	movie.SourceKey = ""
+	movie.IsTranscode = false
 	movie.MoreSources = nil
 	movie.Headers = nil
 	movie.Subtitles = nil
@@ -751,16 +796,21 @@ func rebuildEmbyProxyMovie(
 			return nil, err
 		}
 
-		sourceType := utils.GetURLExtension(source.URL)
+		sourceType := embySourceType(source)
+		sourceKey := embySourceKey(source, sourceIndex)
 		if !hasSource {
 			movie.URL = proxyURL
 			movie.Type = sourceType
+			movie.SourceKey = sourceKey
+			movie.IsTranscode = source.IsTranscode
 			hasSource = true
 		} else {
 			movie.MoreSources = append(movie.MoreSources, &dbModel.MoreSource{
-				Name: source.Name,
-				URL:  proxyURL,
-				Type: sourceType,
+				Name:        source.Name,
+				URL:         proxyURL,
+				Type:        sourceType,
+				SourceKey:   sourceKey,
+				IsTranscode: source.IsTranscode,
 			})
 		}
 

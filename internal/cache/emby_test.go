@@ -214,6 +214,25 @@ func TestProcessMediaSourceTreatsDirectURLAsValidWithoutContainer(t *testing.T) 
 	if err != nil || source == nil || source.URL == "" {
 		t.Fatalf("direct source = (%#v, %v)", source, err)
 	}
+	if source.ID != "source" || source.Container != "" || source.IsTranscode {
+		t.Fatalf("source metadata = %#v", source)
+	}
+}
+
+func TestProcessMediaSourcePreservesUpstreamIdentityAndContainer(t *testing.T) {
+	source, err := processMediaSource(
+		&emby.MediaSourceInfo{Id: "media-source-id", Container: "MKV", DirectPlayUrl: "/Videos/item/stream"},
+		nil,
+		&EmbyUserCacheData{Host: "https://emby.example", APIKey: testEmbyAPIKey},
+		"item",
+		mustTestURL(t, "https://emby.example"),
+	)
+	if err != nil || source == nil {
+		t.Fatalf("process media source = (%#v, %v)", source, err)
+	}
+	if source.ID != "media-source-id" || source.Container != "MKV" || source.IsTranscode {
+		t.Fatalf("source identity metadata = %#v", source)
+	}
 }
 
 type playbackInfoResultClient struct {

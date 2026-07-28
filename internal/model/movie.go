@@ -64,9 +64,11 @@ func (m *Movie) BeforeSave(tx *gorm.DB) error {
 }
 
 type MoreSource struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
-	URL  string `json:"url"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	Type        string `json:"type,omitempty"`
+	SourceKey   string `json:"sourceKey,omitempty"`
+	IsTranscode bool   `json:"isTranscode,omitempty"`
 }
 
 type MovieBase struct {
@@ -76,6 +78,8 @@ type MovieBase struct {
 	URL         string               `gorm:"type:text"                            json:"url"`
 	Name        string               `gorm:"not null;type:text"                   json:"name"`
 	Type        string               `                                            json:"type"`
+	SourceKey   string               `gorm:"-"                                    json:"sourceKey,omitempty"`
+	IsTranscode bool                 `gorm:"-"                                    json:"isTranscode,omitempty"`
 	ParentID    EmptyNullString      `gorm:"type:char(32)"                        json:"parentId"`
 	MoreSources []*MoreSource        `gorm:"serializer:fastjson;type:text"        json:"moreSources,omitempty"`
 	Danmu       string               `gorm:"type:text"                            json:"danmu"`
@@ -94,9 +98,11 @@ func (m *MovieBase) Clone() *MovieBase {
 	mss := make([]*MoreSource, len(m.MoreSources))
 	for i, ms := range m.MoreSources {
 		mss[i] = &MoreSource{
-			Name: ms.Name,
-			Type: ms.Type,
-			URL:  ms.URL,
+			Name:        ms.Name,
+			Type:        ms.Type,
+			URL:         ms.URL,
+			SourceKey:   ms.SourceKey,
+			IsTranscode: ms.IsTranscode,
 		}
 	}
 
@@ -121,6 +127,8 @@ func (m *MovieBase) Clone() *MovieBase {
 		Proxy:       m.Proxy,
 		RtmpSource:  m.RtmpSource,
 		Type:        m.Type,
+		SourceKey:   m.SourceKey,
+		IsTranscode: m.IsTranscode,
 		Headers:     hds,
 		Subtitles:   sbs,
 		VendorInfo:  m.VendorInfo,

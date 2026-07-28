@@ -427,8 +427,10 @@ func TestRebuildEmbyProxyMovieClearsStaleFieldsAndUsesFirstValidSource(t *testin
 		ID:     "movie-id",
 		RoomID: "room-id",
 		MovieBase: dbModel.MovieBase{
-			URL:  "https://creator.example/stale.mp4?api_key=secret",
-			Type: "stale",
+			URL:         "https://creator.example/stale.mp4?api_key=secret",
+			Type:        "stale",
+			SourceKey:   "stale-source",
+			IsTranscode: true,
 			Headers: map[string]string{
 				"Authorization": "secret",
 			},
@@ -443,8 +445,10 @@ func TestRebuildEmbyProxyMovieClearsStaleFieldsAndUsesFirstValidSource(t *testin
 	sources := []cache.EmbySource{
 		{URL: "", Name: "empty", Subtitles: []*cache.EmbySubtitleCache{{Name: "ignored", URL: "https://creator.example/ignored.vtt?api_key=secret"}}},
 		{
-			URL:  "https://creator.example/video.m3u8?api_key=secret",
-			Name: "primary",
+			URL:         "https://creator.example/video.m3u8?api_key=secret",
+			ID:          "proxy-primary-id",
+			Name:        "primary",
+			IsTranscode: true,
 			Subtitles: []*cache.EmbySubtitleCache{
 				{Name: "English", Type: "vtt", URL: "https://creator.example/subtitle.vtt?api_key=secret"},
 			},
@@ -463,11 +467,17 @@ func TestRebuildEmbyProxyMovieClearsStaleFieldsAndUsesFirstValidSource(t *testin
 	if got.Type != "m3u8" {
 		t.Fatalf("type = %q, want m3u8", got.Type)
 	}
+	if got.SourceKey != "proxy-primary-id" || !got.IsTranscode {
+		t.Fatalf("primary source metadata = (%q, %t)", got.SourceKey, got.IsTranscode)
+	}
 	if query := mustParseQuery(t, got.URL); query.Get("source") != "1" {
 		t.Fatalf("primary source query = %q", query.Encode())
 	}
 	if len(got.MoreSources) != 1 || mustParseQuery(t, got.MoreSources[0].URL).Get("source") != "2" {
 		t.Fatalf("more sources = %#v", got.MoreSources)
+	}
+	if got.MoreSources[0].SourceKey != "emby-source:2" || got.MoreSources[0].IsTranscode {
+		t.Fatalf("more source metadata = (%q, %t)", got.MoreSources[0].SourceKey, got.MoreSources[0].IsTranscode)
 	}
 	if len(got.Subtitles) != 1 || got.Subtitles["English"] == nil {
 		t.Fatalf("subtitles = %#v", got.Subtitles)
@@ -484,6 +494,147 @@ func TestRebuildEmbyProxyMovieClearsStaleFieldsAndUsesFirstValidSource(t *testin
 		if strings.Contains(string(output), sensitive) {
 			t.Fatalf("proxy output leaked %q: %q", sensitive, output)
 		}
+	}
+}
+
+func TestRebuildEmbyDirectMovieClearsStaleFieldsAndProjectsSources(t *testing.T) {
+	movie := &dbModel.Movie{
+		ID:     "movie-id",
+		RoomID: "room-id",
+		MovieBase: dbModel.MovieBase{
+			URL:         "https://creator.example/stale.mp4?api_key=stale",
+			Type:        "stale",
+			SourceKey:   "stale-source",
+			IsTranscode: true,
+			Headers: map[string]string{
+				"Authorization": "stale",
+			},
+			MoreSources: []*dbModel.MoreSource{
+				{Name: "stale", URL: "https://creator.example/stale-more.mp4", Type: "stale"},
+			},
+			Subtitles: map[string]*dbModel.Subtitle{
+				"stale": {URL: "https://creator.example/stale.vtt", Type: "vtt"},
+			},
+		},
+	}
+	const mkvURL = "https://creator.example/video.MKV?stream=direct&token=source-secret"
+	sources := []cache.EmbySource{
+		{
+			URL:       "",
+			Name:      "empty",
+			Subtitles: []*cache.EmbySubtitleCache{{Name: "ignored", Type: "vtt"}},
+		},
+		{
+			URL:       mkvURL,
+			ID:        "direct-primary-id",
+			Name:      "primary",
+			Subtitles: []*cache.EmbySubtitleCache{{Name: "English", Type: "vtt"}},
+		},
+		{URL: "https://creator.example/backup.MP4?token=source-secret", ID: "direct-backup-id", Name: "backup"},
+	}
+
+	got, err := rebuildEmbyDirectMovie(movie, sources, "member-token")
+	if err != nil {
+		t.Fatalf("rebuild direct movie: %v", err)
+	}
+
+	if got.URL != mkvURL {
+		t.Fatal("primary URL was not projected")
+	}
+	if got.Type != "mkv" {
+		t.Fatalf("primary type = %q, want mkv", got.Type)
+	}
+	if got.SourceKey != "direct-primary-id" || got.IsTranscode {
+		t.Fatalf("primary source metadata = (%q, %t)", got.SourceKey, got.IsTranscode)
+	}
+	if got.Headers != nil {
+		t.Fatal("stale headers were not cleared")
+	}
+	if len(got.Subtitles) != 1 || got.Subtitles["English"] == nil {
+		t.Fatal("empty source subtitles were not skipped")
+	}
+	if query := mustParseQuery(t, got.Subtitles["English"].URL); query.Get("source") != "1" || query.Get("id") != "0" {
+		t.Fatalf("subtitle source selection = %q/%q", query.Get("source"), query.Get("id"))
+	}
+	if len(got.MoreSources) != 1 {
+		t.Fatalf("more source count = %d, want 1", len(got.MoreSources))
+	}
+	if got.MoreSources[0].Name != "backup" || got.MoreSources[0].Type != "mp4" ||
+		got.MoreSources[0].SourceKey != "direct-backup-id" || got.MoreSources[0].IsTranscode {
+		t.Fatal("backup source metadata mismatch")
+	}
+	if got.MoreSources[0].URL != sources[2].URL {
+		t.Fatal("backup source URL was not projected")
+	}
+}
+
+func TestRebuildEmbyDirectMovieUsesStableIdentityContainerAndOriginalSlots(t *testing.T) {
+	got, err := rebuildEmbyDirectMovie(&dbModel.Movie{}, []cache.EmbySource{
+		{},
+		{URL: "https://creator.example/Videos/primary/stream", ID: "primary-id", Name: "primary", Container: "MKV"},
+		{},
+		{URL: "https://creator.example/Videos/backup/stream", Name: "backup", Container: "MP4"},
+	}, "member-token")
+	if err != nil {
+		t.Fatalf("rebuild direct movie: %v", err)
+	}
+	if got.Type != "mkv" || got.SourceKey != "primary-id" || got.IsTranscode {
+		t.Fatalf("primary metadata = (%q, %q, %t)", got.Type, got.SourceKey, got.IsTranscode)
+	}
+	if len(got.MoreSources) != 1 {
+		t.Fatalf("more source count = %d, want 1", len(got.MoreSources))
+	}
+	more := got.MoreSources[0]
+	if more.Type != "mp4" || more.SourceKey != "emby-source:3" || more.IsTranscode {
+		t.Fatalf("more source metadata = (%q, %q, %t), want original slot fallback", more.Type, more.SourceKey, more.IsTranscode)
+	}
+}
+
+func TestRebuildEmbyDirectMovieKeepsTranscodeAsNonMKVSource(t *testing.T) {
+	const transcodeURL = "https://creator.example/video.m3u8?stream=transcode&token=source-secret"
+	got, err := rebuildEmbyDirectMovie(&dbModel.Movie{}, []cache.EmbySource{
+		{URL: transcodeURL, ID: "transcoded-id", Name: "transcoded", Container: "mkv", IsTranscode: true},
+		{URL: "https://creator.example/video.mkv?stream=direct&token=source-secret", ID: "direct-id", Name: "direct"},
+	}, "member-token")
+	if err != nil {
+		t.Fatalf("rebuild direct movie: %v", err)
+	}
+	if got.URL != transcodeURL {
+		t.Fatal("transcoded primary URL was not retained")
+	}
+	if got.Type != "m3u8" || !got.IsTranscode || got.SourceKey != "transcoded-id" {
+		t.Fatalf("transcoded metadata = (%q, %t, %q), want URL extension, transcode flag, and stable ID", got.Type, got.IsTranscode, got.SourceKey)
+	}
+	if len(got.MoreSources) != 1 || got.MoreSources[0].Type != "mkv" || got.MoreSources[0].IsTranscode || got.MoreSources[0].SourceKey != "direct-id" {
+		t.Fatal("direct MKV source metadata mismatch")
+	}
+}
+
+func TestRebuildEmbyDirectMovieRejectsMissingSourcesAfterClearingFields(t *testing.T) {
+	movie := &dbModel.Movie{
+		MovieBase: dbModel.MovieBase{
+			URL:         "https://creator.example/stale.mp4?token=stale",
+			Type:        "stale",
+			SourceKey:   "stale-source",
+			IsTranscode: true,
+			Headers:     map[string]string{"Authorization": "stale"},
+			MoreSources: []*dbModel.MoreSource{{URL: "https://creator.example/stale-more.mp4"}},
+			Subtitles:   map[string]*dbModel.Subtitle{"stale": {URL: "https://creator.example/stale.vtt"}},
+		},
+	}
+
+	got, err := rebuildEmbyDirectMovie(movie, []cache.EmbySource{
+		{Name: "empty", Subtitles: []*cache.EmbySubtitleCache{{Name: "ignored"}}},
+	}, "member-token")
+	if err == nil || err.Error() != "no source" {
+		t.Fatalf("error = %v, want no source", err)
+	}
+	if got != nil {
+		t.Fatalf("movie = %#v, want nil", got)
+	}
+	if movie.URL != "" || movie.Type != "" || movie.SourceKey != "" || movie.IsTranscode ||
+		movie.MoreSources != nil || movie.Headers != nil || movie.Subtitles != nil {
+		t.Fatal("stale fields remained after no-source rejection")
 	}
 }
 
@@ -580,6 +731,9 @@ func TestRebuildEmbyProxyMovieRejectsMissingSources(t *testing.T) {
 		RoomID: "room-id",
 		MovieBase: dbModel.MovieBase{
 			URL:         "https://creator.example/stale.mp4?api_key=secret",
+			Type:        "stale",
+			SourceKey:   "stale-source",
+			IsTranscode: true,
 			Headers:     map[string]string{"Authorization": "secret"},
 			MoreSources: []*dbModel.MoreSource{{URL: "https://creator.example/stale-more.mp4"}},
 			Subtitles:   map[string]*dbModel.Subtitle{"stale": {URL: "https://creator.example/stale.vtt"}},
@@ -593,7 +747,8 @@ func TestRebuildEmbyProxyMovieRejectsMissingSources(t *testing.T) {
 	if got != nil {
 		t.Fatalf("movie = %#v, want nil", got)
 	}
-	if movie.URL != "" || movie.MoreSources != nil || movie.Headers != nil || movie.Subtitles != nil {
+	if movie.URL != "" || movie.Type != "" || movie.SourceKey != "" || movie.IsTranscode ||
+		movie.MoreSources != nil || movie.Headers != nil || movie.Subtitles != nil {
 		t.Fatalf("stale fields remained after rejection: %#v", movie.MovieBase)
 	}
 }

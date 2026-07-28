@@ -72,7 +72,9 @@ func EmbyAuthorizationCacheWithUserIDInitFunc(userID, serverID string) (*EmbyUse
 
 type EmbySource struct {
 	URL         string
+	ID          string
 	Name        string
+	Container   string
 	Subtitles   []*EmbySubtitleCache
 	IsTranscode bool
 }
@@ -654,7 +656,11 @@ func processMediaSource(
 	truePath string,
 	u *url.URL,
 ) (*EmbySource, error) {
-	source := &EmbySource{Name: v.GetName()}
+	source := &EmbySource{
+		ID:        v.GetId(),
+		Name:      v.GetName(),
+		Container: v.GetContainer(),
+	}
 
 	switch {
 	case v.GetTranscodingUrl() != "":

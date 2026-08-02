@@ -68,6 +68,8 @@ func embyUserCacheDataFromVendor(v *dbModel.EmbyVendor) (*cache.EmbyUserCacheDat
 		Backend:          v.Backend,
 		UserID:           v.EmbyUserID,
 		BindingUpdatedAt: v.UpdatedAt,
+		Username:         v.Username,
+		Password:         v.Password,
 	}, nil
 }
 
@@ -129,6 +131,8 @@ func Login(ctx *gin.Context) {
 		APIKey:     data.GetToken(),
 		Backend:    backend,
 		EmbyUserID: data.GetUserId(),
+		Username:   req.Username,
+		Password:   []byte(req.Password),
 	})
 	if err != nil {
 		ctx.AbortWithStatusJSON(http.StatusInternalServerError, model.NewAPIErrorStringResp("internal server error"))

@@ -38,6 +38,13 @@ type EmbyUserCacheData struct {
 	UserID           string
 	Backend          string
 	BindingUpdatedAt time.Time
+
+	// Username and Password carry the stored Emby credentials so an expired
+	// session token can be silently refreshed. Password is empty when no
+	// credential secret is configured or the binding predates credential
+	// storage; in that case auto-refresh is simply unavailable.
+	Username string
+	Password []byte
 }
 
 func NewEmbyUserCache(userID string) *EmbyUserCache {
@@ -67,6 +74,8 @@ func EmbyAuthorizationCacheWithUserIDInitFunc(userID, serverID string) (*EmbyUse
 		UserID:           v.EmbyUserID,
 		Backend:          v.Backend,
 		BindingUpdatedAt: v.UpdatedAt,
+		Username:         v.Username,
+		Password:         v.Password,
 	}, nil
 }
 

@@ -1,8 +1,11 @@
 package vendoremby
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	log "github.com/sirupsen/logrus"
+	"github.com/synctv-org/synctv/internal/cache"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -151,16 +154,38 @@ EmbyFSListResp:
 
 	cli := vendor.LoadEmbyClient(ctx.Query("backend"))
 
-	data, err := cli.FsList(ctx, &emby.FsListReq{
-		Host:       aucd.Host,
-		Path:       req.Path,
-		Token:      aucd.APIKey,
-		UserId:     aucd.UserID,
-		Limit:      uint64(size),
-		StartIndex: uint64((page - 1) * size),
-		SearchTerm: req.Keyword,
-	})
+	data, err := withEmbyTokenRefresh(
+		ctx,
+		func(refreshCtx context.Context) (*cache.EmbyUserCacheData, error) {
+			return refreshEmbyToken(refreshCtx, user, serverID)
+		},
+		func(callCtx context.Context, binding *cache.EmbyUserCacheData) (*emby.FsListResp, error) {
+			return cli.FsList(callCtx, &emby.FsListReq{
+				Host:       binding.Host,
+				Path:       req.Path,
+				Token:      binding.APIKey,
+				UserId:     binding.UserID,
+				Limit:      uint64(size),
+				StartIndex: uint64((page - 1) * size),
+				SearchTerm: req.Keyword,
+			})
+		},
+		aucd,
+	)
 	if err != nil {
+		// A token that is still rejected after a refresh means the stored
+		// credentials can no longer authenticate; tell the user to rebind rather
+		// than leaking the upstream 401 body.
+		if isEmbyUnauthorized(err) {
+			log.WithField("error", err.Error()).Error("emby fs list unauthorized after refresh")
+			ctx.AbortWithStatusJSON(
+				http.StatusUnauthorized,
+				model.NewAPIErrorStringResp("emby login expired, please rebind"),
+			)
+
+			return
+		}
+
 		ctx.AbortWithStatusJSON(
 			http.StatusInternalServerError,
 			model.NewAPIErrorResp(fmt.Errorf("emby fs list error: %w", err)),

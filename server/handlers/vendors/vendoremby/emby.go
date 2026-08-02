@@ -616,6 +616,25 @@ func embySubtitleProxyURL(movieID, roomID, userToken string, source, id int) (st
 	return (&url.URL{Path: rawPath, RawQuery: rawQuery.Encode()}).String(), nil
 }
 
+// embySubtitleHasUsableRoute reports whether the upstream can actually serve a
+// subtitle. A stream with neither an accepted DeliveryUrl nor a supported
+// fallback format has no reachable endpoint at all, so publishing it would only
+// add a menu entry that always fails and log a 500 on every attempt. Graphical
+// subtitles (PGS/VobSub) land here because they are not text and have no text
+// fallback. Routes that are merely unreachable on one server, such as a
+// well-formed fallback URL that answers 404, are still published.
+func embySubtitleHasUsableRoute(subtitle *cache.EmbySubtitleCache) bool {
+	if subtitle == nil {
+		return false
+	}
+	// processEmbySubtitles seeds RouteSource with "none" and only overwrites it
+	// once a delivery URL or a text fallback is accepted, so that value is the
+	// single authoritative signal. An unset RouteSource means the entry was never
+	// classified (older cache payloads, hand-built values in tests) and must be
+	// published rather than silently dropped.
+	return subtitle.RouteSource != "none"
+}
+
 func addEmbySourceSubtitles(
 	movie *dbModel.Movie,
 	source cache.EmbySource,
@@ -634,6 +653,12 @@ func addEmbySourceSubtitles(
 
 	for subtitleIndex, subtitle := range source.Subtitles {
 		if subtitle == nil {
+			continue
+		}
+		// subtitleIndex stays the index within source.Subtitles so the proxy id
+		// keeps addressing the same upstream stream even when earlier entries are
+		// skipped here.
+		if !embySubtitleHasUsableRoute(subtitle) {
 			continue
 		}
 

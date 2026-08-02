@@ -1223,3 +1223,58 @@ func mustParseQuery(t *testing.T, rawURL string) url.Values {
 	}
 	return parsed.Query()
 }
+
+func TestAddEmbySourceSubtitlesSkipsRoutelessStreams(t *testing.T) {
+	// A graphical (non_text) stream with no DeliveryUrl and no supported text
+	// fallback has no reachable endpoint, so it must not become a menu entry.
+	movie := &dbModel.Movie{ID: "movie-1", RoomID: "room-1"}
+	source := cache.EmbySource{
+		Subtitles: []*cache.EmbySubtitleCache{
+			{Name: "Graphical", URL: "", RouteSource: "none"},
+			{Name: "Chinese", URL: "https://emby.example/sub.srt", Type: "srt", RouteSource: "delivery_url"},
+		},
+	}
+
+	if err := addEmbySourceSubtitles(movie, source, "token", 0); err != nil {
+		t.Fatalf("addEmbySourceSubtitles returned error: %v", err)
+	}
+
+	if len(movie.Subtitles) != 1 {
+		t.Fatalf("expected exactly one published subtitle, got %d", len(movie.Subtitles))
+	}
+	if _, ok := movie.Subtitles["Graphical"]; ok {
+		t.Fatal("routeless non_text subtitle must not be published")
+	}
+	published, ok := movie.Subtitles["Chinese"]
+	if !ok {
+		t.Fatal("delivery_url subtitle must still be published")
+	}
+
+	// Index correctness: the surviving entry is index 1 in source.Subtitles and
+	// its proxy id must still be 1, not renumbered to 0.
+	parsed, err := url.Parse(published.URL)
+	if err != nil {
+		t.Fatalf("published subtitle URL is not parsable: %v", err)
+	}
+	if got := parsed.Query().Get("id"); got != "1" {
+		t.Fatalf("proxy id must keep the upstream index, want 1, got %q", got)
+	}
+}
+
+func TestAddEmbySourceSubtitlesKeepsFallbackRoute(t *testing.T) {
+	// A well-formed fallback URL may 404 on this server but work elsewhere, so
+	// it must still be published.
+	movie := &dbModel.Movie{ID: "movie-2", RoomID: "room-2"}
+	source := cache.EmbySource{
+		Subtitles: []*cache.EmbySubtitleCache{
+			{Name: "Fallback", URL: "https://emby.example/Stream.srt", Type: "srt", RouteSource: "vtt_fallback"},
+		},
+	}
+
+	if err := addEmbySourceSubtitles(movie, source, "token", 0); err != nil {
+		t.Fatalf("addEmbySourceSubtitles returned error: %v", err)
+	}
+	if len(movie.Subtitles) != 1 {
+		t.Fatalf("supported fallback route must be published, got %d entries", len(movie.Subtitles))
+	}
+}

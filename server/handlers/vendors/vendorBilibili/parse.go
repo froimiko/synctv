@@ -39,7 +39,14 @@ func Parse(ctx *gin.Context) {
 		return
 	}
 
-	cli := vendor.LoadBilibiliClient(ctx.Query("backend"))
+	// The frontend sends the selected backend as the "vendor" query parameter,
+	// while other vendor handlers read "backend". Accept both so the bilibili
+	// parse dialog's backend selector actually takes effect.
+	backend := ctx.Query("backend")
+	if backend == "" {
+		backend = ctx.Query("vendor")
+	}
+	cli := vendor.LoadBilibiliClient(backend)
 
 	resp, err := cli.Match(ctx, &bilibili.MatchReq{
 		Url: req.URL,
